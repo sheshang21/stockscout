@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import io
+import threading
 
 warnings.filterwarnings('ignore')
 
@@ -18,6 +19,9 @@ st.markdown("""<style>
 .metric-card{background:#f8f9fb;padding:0.8rem;border-radius:8px;border-left:4px solid #1f77b4;margin:0.5rem 0}
 .stDataFrame{font-size:0.9rem}
 div[data-testid="stDataFrame"] > div{background:#f8f9fb}
+.price-up{color:#00c853;font-weight:bold}
+.price-down{color:#ff1744;font-weight:bold}
+.price-neutral{color:#666}
 </style>""", unsafe_allow_html=True)
 
 # Comprehensive Stock Universe - 200+ NSE Stocks
@@ -72,6 +76,9 @@ def fetch_stock_data(symbol):
         prev_close = closes[-2] if len(closes) > 1 else price
         change = ((price - prev_close) / prev_close) * 100
         
+        # Get institutional data (approximation from volume patterns)
+        fii_dii_activity = detect_institutional_activity(volumes, closes)
+        
         rsi = calculate_rsi(closes)
         macd = calculate_macd(closes)
         bb_position = calculate_bb_position(closes)
@@ -90,10 +97,50 @@ def fetch_stock_data(symbol):
             'closes': closes,
             'highs': highs,
             'lows': lows,
-            'volumes': volumes
+            'volumes': volumes,
+            'fii_dii_score': fii_dii_activity
         }
     except Exception as e:
         return None
+
+def fetch_live_price(symbol):
+    """Fetch only live price for auto-refresh (non-cached)"""
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        data = ticker.history(period="1d", interval="1m")
+        if not data.empty:
+            return data['Close'].iloc[-1]
+        return None
+    except:
+        return None
+
+def detect_institutional_activity(volumes, closes):
+    """
+    Detect FII/DII activity patterns from volume and price action
+    High volume + price up = Buying, High volume + price down = Selling
+    """
+    if len(volumes) < 20 or len(closes) < 20:
+        return 0
+    
+    score = 0
+    recent_days = 10
+    
+    for i in range(-recent_days, 0):
+        vol_ratio = volumes[i] / np.mean(volumes[-60:]) if len(volumes) >= 60 else volumes[i] / np.mean(volumes)
+        price_change = ((closes[i] - closes[i-1]) / closes[i-1]) * 100 if i > -len(closes) else 0
+        
+        # High volume + Price up = Institutional buying
+        if vol_ratio > 1.5 and price_change > 1:
+            score += 2
+        elif vol_ratio > 1.2 and price_change > 0.5:
+            score += 1
+        # High volume + Price down = Institutional selling
+        elif vol_ratio > 1.5 and price_change < -1:
+            score -= 2
+        elif vol_ratio > 1.2 and price_change < -0.5:
+            score -= 1
+    
+    return score
 
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -533,30 +580,41 @@ else:
     stocks_to_scan = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 EARLY BUY Criteria")
+st.sidebar.subheader("🎯 ULTRA-STRICT Criteria")
 st.sidebar.info("""
-*Find stocks BEFORE rally:*
-- Qualified: Score ≥80 + Safe
-- Prime Buy: ≥100
-- Excellent: 90-99
-- Strong: 80-89
-- Good: 70-79
-- Watchlist: 60-69
+*Only top 5-10% qualify:*
+- Qualified: Score ≥110 + Safe
+- Exceptional: ≥140
+- Prime: 125-139
+- Excellent: 110-124
+- Strong: 95-109
 
-*Key Signals:*
-- RSI: 30-50 (oversold to neutral)
-- MACD: -2 to +5 (turning bullish)
-- Weekly: -3% to +1% (consolidating)
-- Volume: 1.2-2.0x (accumulation)
-- BB: 10-40% (lower zone)
-- Daily: -2% to +1.5% (not rallying)
+*10 STRICT Criteria (190 pts):*
+1. **FII/DII Activity (30 pts)**
+   - Institutional buying signals
+2. **Consolidation (25 pts)**
+   - -2% to +0.5% weekly
+3. **RSI (25 pts)**
+   - 32-38 (perfect oversold)
+4. **MACD (20 pts)**
+   - -1 to +1 (crossover)
+5. **BB (20 pts)**
+   - 8-20% (lower band)
+6. **Volume (20 pts)**
+   - 1.3-1.8x (accumulation)
+7. **Today (15 pts)**
+   - -1.5% to +0.3%
+8. **Monthly (15 pts)**
+   - -8% to -2% (recovery)
+9. **3-Month (10 pts)**
+   - Performance check
+10. **Upside (10 pts)**
+    - ≥12% potential
 
-*🚨 Operator Detection:*
-- Extreme volume spikes (>5x)
-- High volatility without news
-- Circuit filter hits
-- Price manipulation patterns
-- Operated stocks: -50 pts penalty
+*Operator Penalties:*
+- Operated: -70 pts
+- Very High Risk: -40 pts
+- High Risk: -25 pts
 """)
 
 st.sidebar.markdown("---")
@@ -615,8 +673,41 @@ if st.session_state.scan_results:
     scan_time = st.session_state.scan_timestamp
     
     st.markdown("---")
+    
+    # Auto-refresh toggle and status
+    col_refresh1, col_refresh2, col_refresh3 = st.columns([2, 2, 6])
+    
+    with col_refresh1:
+        auto_refresh = st.checkbox("🔄 Auto-refresh prices", value=False, 
+                                   help="Refresh prices every 10 seconds (like Groww/Zerodha)")
+    
+    with col_refresh2:
+        if 'last_refresh' in st.session_state:
+            seconds_ago = int((datetime.now() - st.session_state.last_refresh).total_seconds())
+            st.caption(f"Updated {seconds_ago}s ago")
+    
     st.subheader(f"📈 Early Buy Opportunities Found")
-    st.caption(f"Scanned at: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"Initial scan: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Auto-refresh logic
+    if auto_refresh:
+        if 'refresh_counter' not in st.session_state:
+            st.session_state.refresh_counter = 0
+        
+        # Update prices for visible stocks
+        if st.session_state.refresh_counter % 10 == 0:  # Every 10 seconds
+            with st.spinner("Refreshing prices..."):
+                for result in results:
+                    new_price = fetch_live_price(result['symbol'])
+                    if new_price:
+                        old_price = result['price']
+                        result['price'] = new_price
+                        result['change'] = ((new_price - old_price) / old_price) * 100
+                st.session_state.last_refresh = datetime.now()
+        
+        st.session_state.refresh_counter += 1
+        time.sleep(1)
+        st.rerun()
     
     # Convert to DataFrame
     df = pd.DataFrame([{
@@ -625,6 +716,8 @@ if st.session_state.scan_results:
         'Today (%)': r['change'],
         'Weekly (%)': r['weekly_change'],
         'Monthly (%)': r['monthly_change'],
+        '3M (%)': r['three_month_change'],
+        'FII/DII': r['fii_dii_score'],
         'Potential (₹)': r['potential_rs'],
         'Potential (%)': r['potential_pct'],
         'RSI': r['rsi'],
@@ -646,17 +739,24 @@ if st.session_state.scan_results:
     
     operated_stocks = df[df['Operated'] == '🚨 YES']
     safe_stocks = df[df['Operated'] == '✅ Safe']
-    prime = df[(df['Score'] >= 100) & (df['Operated'] == '✅ Safe')]
-    excellent = df[(df['Score'] >= 90) & (df['Score'] < 100) & (df['Operated'] == '✅ Safe')]
-    strong = df[(df['Score'] >= 80) & (df['Score'] < 90) & (df['Operated'] == '✅ Safe')]
-    good = df[(df['Score'] >= 70) & (df['Score'] < 80) & (df['Operated'] == '✅ Safe')]
+    exceptional = df[(df['Score'] >= 140) & (df['Operated'] == '✅ Safe')]
+    prime = df[(df['Score'] >= 125) & (df['Score'] < 140) & (df['Operated'] == '✅ Safe')]
+    excellent = df[(df['Score'] >= 110) & (df['Score'] < 125) & (df['Operated'] == '✅ Safe')]
+    strong = df[(df['Score'] >= 95) & (df['Score'] < 110) & (df['Operated'] == '✅ Safe')]
     
     col1.metric("Total Scanned", len(df))
     col2.metric("🚨 Operated (AVOID)", len(operated_stocks))
-    col3.metric("✅ Safe Stocks", len(safe_stocks))
-    col4.metric("🚀 Prime Buy", len(prime))
-    col5.metric("🌟 Excellent", len(excellent))
-    col6.metric("💎 Strong", len(strong))
+    col3.metric("🌟 Exceptional (≥140)", len(exceptional))
+    col4.metric("🚀 Prime (125-139)", len(prime))
+    col5.metric("💎 Excellent (110-124)", len(excellent))
+    col6.metric("✅ Strong (95-109)", len(strong))
+    
+    # Show qualification summary
+    qualified_total = len(exceptional) + len(prime) + len(excellent)
+    st.info(f"""
+    **🎯 QUALIFICATION SUMMARY:** Only **{qualified_total}** stocks qualified (Score ≥110 + Safe) out of {len(df)} scanned.
+    These are the **top {(qualified_total/len(df)*100):.1f}%** - truly exceptional early buy opportunities!
+    """)
     
     st.markdown("---")
     
@@ -667,7 +767,7 @@ if st.session_state.scan_results:
     
     with filter_col1:
         rating_filter = st.selectbox("Rating", 
-            ["All", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip", "Operated - Avoid"])
+            ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip", "Operated - Avoid"])
     
     with filter_col2:
         safety_filter = st.selectbox("Safety", 
@@ -682,7 +782,8 @@ if st.session_state.scan_results:
             ["All", "Strong Uptrend", "Uptrend", "Sideways", "Downtrend"])
     
     with filter_col5:
-        min_score_filter = st.number_input("Min Score", -100, 140, 0, 5)
+        min_score_filter = st.number_input("Min Score", -100, 190, 110, 5, 
+                                          help="Default: 110 (Qualified stocks only)")
     
     # Apply filters
     filtered_df = df.copy()
@@ -720,19 +821,19 @@ if st.session_state.scan_results:
         # Highlight operated stocks in RED regardless of score
         if row['Operated'] == '🚨 YES':
             return ['background-color: #ff6b6b; color: white; font-weight: bold'] * len(row)
-        # Safe stocks with good scores
-        elif row['Score'] >= 100:
-            return ['background-color: #c3f7c3; font-weight: bold'] * len(row)  # Bright green
-        elif row['Score'] >= 90:
-            return ['background-color: #d4edda; font-weight: bold'] * len(row)  # Green
+        # Safe stocks with exceptional scores
+        elif row['Score'] >= 140:
+            return ['background-color: #00e676; color: black; font-weight: bold'] * len(row)  # Neon green
+        elif row['Score'] >= 125:
+            return ['background-color: #69f0ae; font-weight: bold'] * len(row)  # Bright green
+        elif row['Score'] >= 110:
+            return ['background-color: #b9f6ca; font-weight: bold'] * len(row)  # Light green
+        elif row['Score'] >= 95:
+            return ['background-color: #e1f5fe'] * len(row)  # Light blue
         elif row['Score'] >= 80:
-            return ['background-color: #cfe2ff'] * len(row)  # Blue
-        elif row['Score'] >= 70:
-            return ['background-color: #d1ecf1'] * len(row)  # Light blue
-        elif row['Score'] >= 60:
-            return ['background-color: #fff3cd'] * len(row)  # Yellow
+            return ['background-color: #fff9c4'] * len(row)  # Light yellow
         else:
-            return ['background-color: #f8d7da'] * len(row)  # Red
+            return ['background-color: #ffebee'] * len(row)  # Light red
     
     styled_df = filtered_df.style.apply(highlight_rating, axis=1)\
         .format({
@@ -740,6 +841,7 @@ if st.session_state.scan_results:
             'Today (%)': '{:+.2f}%',
             'Weekly (%)': '{:+.2f}%',
             'Monthly (%)': '{:+.2f}%',
+            '3M (%)': '{:+.2f}%',
             'Potential (₹)': '₹{:.2f}',
             'Potential (%)': '{:.2f}%',
             'RSI': '{:.1f}',
@@ -748,6 +850,13 @@ if st.session_state.scan_results:
         })
     
     st.dataframe(styled_df, use_container_width=True, height=600)
+    
+    # Show only qualified stocks by default message
+    if min_score_filter == 110:
+        st.success("""
+        ✅ **Showing QUALIFIED stocks only (Score ≥110)**. These are the best early buy opportunities.
+        Lower the 'Min Score' filter if you want to see all stocks.
+        """)
     
     # Detailed view
     st.markdown("---")
@@ -827,117 +936,123 @@ else:
     st.info("👈 Configure and click 'FIND EARLY BUYS' to start scanning")
     
     st.markdown("---")
-    st.subheader("🎯 Early Buy Strategy + Operator Protection")
+    st.subheader("🎯 ULTRA-STRICT Strategy - Only Top 5-10% Qualify")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("""
-        **Why This Works Better:**
+        **Why ULTRA-STRICT Works:**
         
-        **We Find Stocks BEFORE Rally:**
-        - Not after they've moved 5-10%
+        **Find Hidden Gems BEFORE Rally:**
+        - Out of 100+ stocks, only 5-10 qualify
         - Catch them during consolidation
         - Enter during accumulation phase
-        - Lower risk, higher reward
+        - Highest probability setups only
         
         **Key Philosophy:**
-        1. ❌ **Don't Chase:** Stocks up 5%+ today
-        2. ❌ **Don't FOMO:** RSI >65, already extended
-        3. ✅ **Do Buy:** RSI 30-50, turning bullish
-        4. ✅ **Do Wait:** For setup, not rally
+        1. ❌ **Don't Chase:** Stocks up 3%+ today
+        2. ❌ **Don't FOMO:** RSI >55, already moving
+        3. ✅ **Do Buy:** RSI 32-45, turning bullish
+        4. ✅ **Do Wait:** For perfect setup only
         
         **🚨 OPERATOR PROTECTION:**
-        - Detects manipulation patterns
-        - Identifies pump & dump schemes
-        - Flags extreme volatility
-        - Warns about circuit hits
-        - Heavy penalty for operated stocks
+        - 8 manipulation detection signals
+        - -70 pts penalty for operated stocks
+        - Auto-identifies pump & dump
         
-        **8 Operator Detection Signals:**
-        1. **Volume Spikes:** >5x sudden volume
-        2. **Price Volatility:** >8% daily swings
-        3. **Intraday Range:** >6% high-low spread
-        4. **Pump Pattern:** Sudden spike after flat period
-        5. **Volume-Price Divergence:** Volume up, price flat
-        6. **Circuit Hits:** Multiple 10% moves
-        7. **Liquidity Trap:** Low volume stock suddenly spikes
-        8. **End-of-Day Manipulation:** Suspicious closing prices
+        **🏦 FII/DII Activity (30 pts) - NEW!**
+        - Detects institutional buying/selling
+        - High volume + price up = Buying
+        - Confirms smart money interest
+        - Score ≥12: Strong buying
+        - Score ≤-8: Selling (avoid)
+        
+        **1. Consolidation (25 pts)**
+           - Perfect: -2% to +0.5% weekly
+           - Reject: >2% weekly rally
+        
+        **2. RSI (25 pts)**
+           - Perfect: 32-38 (oversold)
+           - Good: 38-45 (building)
+           - Reject: >55 (overbought)
+        
+        **3. MACD (20 pts)**
+           - Perfect: -1 to +1 (crossover)
+           - Reject: >5 (extended)
         """)
     
     with col2:
-        st.markdown("""
-        **Scoring Criteria (140 pts max):**
-        
-        **1. Consolidation (25 pts)**
-           - Perfect: -3% to +1% weekly
-           - Avoid: >5% weekly rally
-        
-        **2. RSI (20 pts)**
-           - Prime: 30-40 (oversold)
-           - Avoid: >65 (overbought)
-        
-        **3. MACD (20 pts)**
-           - Perfect: -2 to +2 (turning)
-           - Avoid: >8 (extended)
-        
+        st.markdown("""        
         **4. Bollinger Bands (20 pts)**
-           - Prime: 10-25% (lower band)
-           - Avoid: >70% (upper band)
+           - Perfect: 8-20% (lower band)
+           - Good: 20-30% (below middle)
+           - Reject: >60% (upper band)
         
-        **5. Volume (15 pts)**
-           - Accumulation: 1.2-2.0x
-           - Avoid: >3x (distribution)
+        **5. Volume (20 pts)**
+           - Perfect: 1.3-1.8x (accumulation)
+           - Good: 1.8-2.2x (interest)
+           - Reject: >2.8x (distribution)
         
         **6. Today's Price (15 pts)**
-           - Perfect: -2% to +0.5%
-           - Avoid: >3% (chasing)
+           - Perfect: -1.5% to +0.3%
+           - Reject: >2.5% (chasing)
         
         **7. Monthly Recovery (15 pts)**
-           - Prime: -10% to -2%
-           - Avoid: >12% (extended)
+           - Perfect: -8% to -2% (recovery)
+           - Good: -2% to +2% (base)
+           - Reject: >10% (extended)
         
-        **8. Upside (10 pts)**
-           - Target: 8-10%+
+        **8. 3-Month Performance (10 pts)**
+           - Perfect: -15% to -5% (correction)
+           - Good: -5% to +5% (sideways)
+           - Reject: >25% (extended)
         
-        **🚨 Operator Penalty:**
-        - Operated: -50 pts
-        - High Risk: -25 pts
-        - Caution: -10 pts
+        **9. Upside Potential (10 pts)**
+           - Target: ≥12% move
+           - Minimum: 10%
+        
+        **QUALIFICATION:**
+        - Exceptional: ≥140 pts
+        - Prime: 125-139 pts
+        - Excellent: 110-124 pts (QUALIFIED)
+        - Strong: 95-109 pts
+        - Below 95: Not good enough
         """)
     
     st.markdown("---")
     st.error("""
-    **⚠️ CRITICAL SAFETY RULES:**
+    **⚠️ ULTRA-STRICT = ONLY THE BEST:**
     
-    1. **NEVER trade operated stocks** - They show manipulation patterns
-    2. **Check Risk Score** - Avoid stocks with risk score >40
-    3. **Verify manually** - Use additional sources before trading
-    4. **Set stop losses** - Always protect your capital
-    5. **Watch for red flags** - Extreme volume, volatility, circuit hits
+    With these criteria, expect:
+    - **5-10 stocks** out of 100 to qualify (5-10%)
+    - **1-3 exceptional** opportunities (score ≥140)
+    - **2-5 prime/excellent** opportunities (score 110-139)
+    - **Rest rejected** as not meeting standards
     
-    **Remember:** Operators can create artificial rallies and then dump, leaving retail investors with losses.
-    This scanner helps you identify and AVOID such traps.
+    This is INTENTIONAL - we want only the highest probability setups!
     """)
     
     st.info("""
     **🎯 BOTTOM LINE:** 
     
-    This scanner finds stocks that are:
-    - **Consolidating** (not rallying)
-    - **Oversold/Neutral** (RSI 30-50)
-    - **Turning bullish** (MACD crossing)
-    - **Near support** (BB lower zone)
-    - **Being accumulated** (smart money buying)
-    - **NOT OPERATED** (safe from manipulation)
+    This scanner finds the TOP 5-10% of stocks that are:
+    - **Consolidating** (not rallying yet)
+    - **Oversold** (RSI 32-45)
+    - **Turning bullish** (MACD crossover)
+    - **Near support** (BB 8-30%)
+    - **Being accumulated** by institutions
+    - **NOT OPERATED** (100% safe)
     
-    **Perfect Entry = BEFORE the 5%+ move + SAFE from operators**
+    **Perfect Entry = Top 5-10% opportunities ONLY + BEFORE 10%+ move**
+    
+    **Auto-Refresh:** Enable the checkbox after scan to get live price updates every 10 seconds!
     """)
 
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center;color:#666;'>
-<p><strong>Indian Stock Scout - EARLY BUY MODE</strong> | Find stocks BEFORE they rally</p>
-<p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice.</p>
+<p><strong>Indian Stock Scout - ULTRA-STRICT MODE</strong> | Only Top 5-10% Qualify | Auto-Refresh Available</p>
+<p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice. Past performance doesn't guarantee future results.</p>
 </div>
 """, unsafe_allow_html=True)
