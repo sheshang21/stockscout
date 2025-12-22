@@ -10,7 +10,7 @@ import threading
 
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="Indian Stock Scout - Early Buy Scanner", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Indian Stock Scout - Elite Early Buy Scanner", page_icon="🎯", layout="wide")
 
 # Custom CSS
 st.markdown("""<style>
@@ -59,7 +59,7 @@ SECTOR_MAP = {
 
 @st.cache_data(ttl=300)
 def fetch_stock_data(symbol):
-    """Fetch real-time data from Yahoo Finance"""
+    """Fetch real-time data from Yahoo Finance with fundamentals"""
     try:
         ticker = yf.Ticker(f"{symbol}.NS")
         hist = ticker.history(period="3mo", interval="1d")
@@ -85,6 +85,48 @@ def fetch_stock_data(symbol):
         vol_multiple = calculate_volume_multiple(volumes)
         trend = detect_trend(closes)
         
+        # Fetch FUNDAMENTAL DATA
+        try:
+            info = ticker.info
+            market_cap = info.get('marketCap', 0)
+            
+            # Revenue growth (TTM vs previous year)
+            revenue_growth = info.get('revenueGrowth', None)  # YoY growth
+            if revenue_growth is not None:
+                revenue_growth = revenue_growth * 100  # Convert to percentage
+            
+            # Profit margin
+            profit_margin = info.get('profitMargins', None)
+            if profit_margin is not None:
+                profit_margin = profit_margin * 100
+            
+            # Earnings growth
+            earnings_growth = info.get('earningsGrowth', None)
+            if earnings_growth is not None:
+                earnings_growth = earnings_growth * 100
+            
+            # Operating margin
+            operating_margin = info.get('operatingMargins', None)
+            if operating_margin is not None:
+                operating_margin = operating_margin * 100
+            
+            # ROE (Return on Equity)
+            roe = info.get('returnOnEquity', None)
+            if roe is not None:
+                roe = roe * 100
+            
+            # Debt to Equity
+            debt_to_equity = info.get('debtToEquity', None)
+            
+        except:
+            market_cap = 0
+            revenue_growth = None
+            profit_margin = None
+            earnings_growth = None
+            operating_margin = None
+            roe = None
+            debt_to_equity = None
+        
         return {
             'symbol': symbol,
             'price': price,
@@ -98,7 +140,14 @@ def fetch_stock_data(symbol):
             'highs': highs,
             'lows': lows,
             'volumes': volumes,
-            'fii_dii_score': fii_dii_activity
+            'fii_dii_score': fii_dii_activity,
+            'market_cap': market_cap,
+            'revenue_growth': revenue_growth,
+            'profit_margin': profit_margin,
+            'earnings_growth': earnings_growth,
+            'operating_margin': operating_margin,
+            'roe': roe,
+            'debt_to_equity': debt_to_equity
         }
     except Exception as e:
         return None
@@ -332,207 +381,193 @@ def detect_trend(prices):
     elif ups <= 1:
         return 'Downtrend'
     else:
-        return 'Sideways'
-
-def analyze_stock(data, criteria_config):
-    """Analyze stock to find EARLY BUY opportunities BEFORE rally"""
-    if not data:
-        return None
-    
-    price = data['price']
-    change = data['change']
-    rsi = data['rsi']
-    macd = data['macd']
-    bb = data['bb_position']
-    vol = data['vol_multiple']
-    trend = data['trend']
-    closes = data['closes']
-    
-    # OPERATOR DETECTION - Critical Safety Check
-    is_operated, operator_flags, operator_risk = detect_operator_activity(data)
-    
-    # Calculate additional indicators for early detection
-    weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
-    monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
-    
-    potential_rs = max(20, price * 0.08)  # Higher potential target
-    potential_pct = (potential_rs / price) * 100
-    
-    score = 0
-    criteria = []
-    
-    # CRITICAL: Penalize heavily for operator activity
-    if is_operated:
-        score -= 50  # Heavy penalty
-        criteria.append(f'🚨 OPERATOR DETECTED: Risk Score {operator_risk}/100 - AVOID [-50 pts]')
-    elif operator_risk >= 25:
-        score -= 25
-        criteria.append(f'⚠️ HIGH RISK: Manipulation signs detected (Risk: {operator_risk}/100) [-25 pts]')
-    elif operator_risk >= 15:
-        score -= 10
-        criteria.append(f'⚠️ CAUTION: Some manipulation indicators (Risk: {operator_risk}/100) [-10 pts]')
-    
-    # 1. CONSOLIDATION/ACCUMULATION PHASE (25 pts) - KEY FOR EARLY ENTRY
-    # We want stocks that are NOT rallying yet but showing base building
-    if -3 <= weekly_change <= 1:
-        score += 25
-        criteria.append(f'✅ Consolidation: Perfect base building ({weekly_change:+.1f}% weekly) [25 pts]')
-    elif -5 <= weekly_change <= -3:
-        score += 22
-        criteria.append(f'✅ Consolidation: Healthy pullback ({weekly_change:+.1f}% weekly) [22 pts]')
-    elif 1 < weekly_change <= 3:
-        score += 18
-        criteria.append(f'✅ Consolidation: Early breakout forming ({weekly_change:+.1f}% weekly) [18 pts]')
-    elif weekly_change > 5:
-        score += 0
-        criteria.append(f'❌ Already rallied: Late to party ({weekly_change:+.1f}% weekly) [0 pts]')
-    else:
         score += 5
         criteria.append(f'⚠ Consolidation: Weak ({weekly_change:+.1f}% weekly) [5 pts]')
     
-    # 2. RSI - OVERSOLD TO NEUTRAL ZONE (20 pts) - BEFORE THE MOVE
-    if 30 <= rsi <= 40:
-        score += 20
-        criteria.append(f'✅ RSI: Oversold - Prime entry ({rsi:.0f}) [20 pts]')
-    elif 40 < rsi <= 50:
+    # 3. RSI - STRICTER (25 pts)
+    if 32 <= rsi <= 38:
+        score += 25
+        criteria.append(f'✅ RSI: PERFECT oversold ({rsi:.0f}) [25 pts]')
+    elif 38 < rsi <= 42:
+        score += 22
+        criteria.append(f'✅ RSI: Excellent oversold ({rsi:.0f}) [22 pts]')
+    elif 42 < rsi <= 45:
         score += 18
-        criteria.append(f'✅ RSI: Building momentum ({rsi:.0f}) [18 pts]')
+        criteria.append(f'✅ RSI: Good entry ({rsi:.0f}) [18 pts]')
+    elif 45 < rsi <= 50:
+        score += 12
+        criteria.append(f'⚠ RSI: Neutral ({rsi:.0f}) [12 pts]')
     elif 50 < rsi <= 55:
-        score += 15
-        criteria.append(f'✅ RSI: Early momentum ({rsi:.0f}) [15 pts]')
-    elif 55 < rsi <= 60:
-        score += 10
-        criteria.append(f'⚠ RSI: Neutral ({rsi:.0f}) [10 pts]')
-    elif rsi > 65:
-        score += 0
-        criteria.append(f'❌ RSI: Overbought - Already moved ({rsi:.0f}) [0 pts]')
-    else:
         score += 5
-        criteria.append(f'⚠ RSI: Too oversold ({rsi:.0f}) [5 pts]')
+        criteria.append(f'⚠ RSI: Starting to move ({rsi:.0f}) [5 pts]')
+    elif rsi > 60:
+        score += 0
+        criteria.append(f'❌ RSI: Overbought - Too late ({rsi:.0f}) [0 pts]')
+    else:
+        score += 3
+        criteria.append(f'⚠ RSI: Below range ({rsi:.0f}) [3 pts]')
     
-    # 3. MACD TURNING POSITIVE (20 pts) - EARLY MOMENTUM SIGNAL
-    if -2 <= macd <= 2:
+    # 4. MACD - STRICTER (20 pts)
+    if -1 <= macd <= 1:
         score += 20
-        criteria.append(f'✅ MACD: Turning bullish - Perfect timing ({macd:.1f}) [20 pts]')
-    elif 2 < macd <= 5:
+        criteria.append(f'✅ MACD: PERFECT crossover ({macd:.1f}) [20 pts]')
+    elif 1 < macd <= 2:
         score += 18
         criteria.append(f'✅ MACD: Early bullish ({macd:.1f}) [18 pts]')
-    elif -5 <= macd < -2:
+    elif -2 <= macd < -1:
         score += 15
         criteria.append(f'✅ MACD: About to turn ({macd:.1f}) [15 pts]')
-    elif macd > 8:
+    elif 2 < macd <= 4:
+        score += 10
+        criteria.append(f'⚠ MACD: Building ({macd:.1f}) [10 pts]')
+    elif macd > 6:
         score += 0
-        criteria.append(f'❌ MACD: Too strong - Already moved ({macd:.1f}) [0 pts]')
+        criteria.append(f'❌ MACD: Extended - Too late ({macd:.1f}) [0 pts]')
     else:
         score += 5
         criteria.append(f'⚠ MACD: Weak ({macd:.1f}) [5 pts]')
     
-    # 4. BOLLINGER BANDS - LOWER BAND BOUNCE (20 pts)
-    if 10 <= bb <= 25:
+    # 5. BOLLINGER BANDS - STRICTER (20 pts)
+    if 8 <= bb <= 20:
         score += 20
-        criteria.append(f'✅ BB: Lower band - Mean reversion setup ({bb:.0f}%) [20 pts]')
-    elif 25 < bb <= 40:
+        criteria.append(f'✅ BB: PERFECT lower band ({bb:.0f}%) [20 pts]')
+    elif 20 < bb <= 30:
         score += 18
-        criteria.append(f'✅ BB: Below middle - Good entry ({bb:.0f}%) [18 pts]')
+        criteria.append(f'✅ BB: Excellent entry ({bb:.0f}%) [18 pts]')
+    elif 30 < bb <= 40:
+        score += 12
+        criteria.append(f'✅ BB: Good entry ({bb:.0f}%) [12 pts]')
     elif 40 < bb <= 50:
-        score += 12
-        criteria.append(f'⚠ BB: Middle band ({bb:.0f}%) [12 pts]')
-    elif bb > 70:
-        score += 0
-        criteria.append(f'❌ BB: Upper band - Already extended ({bb:.0f}%) [0 pts]')
-    else:
         score += 8
-        criteria.append(f'⚠ BB: Neutral zone ({bb:.0f}%) [8 pts]')
-    
-    # 5. VOLUME - ACCUMULATION PHASE (15 pts)
-    if 1.2 <= vol <= 2.0:
-        score += 15
-        criteria.append(f'✅ Volume: Smart money accumulation ({vol:.1f}x) [15 pts]')
-    elif 2.0 < vol <= 2.5:
-        score += 12
-        criteria.append(f'✅ Volume: Building interest ({vol:.1f}x) [12 pts]')
-    elif vol > 3.0:
+        criteria.append(f'⚠ BB: Middle band ({bb:.0f}%) [8 pts]')
+    elif bb > 65:
+        score += 0
+        criteria.append(f'❌ BB: Upper band - Extended ({bb:.0f}%) [0 pts]')
+    else:
         score += 5
-        criteria.append(f'⚠ Volume: Too high - Possible peak ({vol:.1f}x) [5 pts]')
-    elif 0.8 <= vol < 1.2:
-        score += 8
-        criteria.append(f'⚠ Volume: Average ({vol:.1f}x) [8 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ Volume: Too low ({vol:.1f}x) [0 pts]')
+        criteria.append(f'⚠ BB: Above middle ({bb:.0f}%) [5 pts]')
     
-    # 6. PRICE ACTION - NOT RALLYING YET (15 pts)
-    if -2 <= change <= 0.5:
+    # 6. VOLUME - STRICTER (20 pts)
+    if 1.3 <= vol <= 1.8:
+        score += 20
+        criteria.append(f'✅ Volume: PERFECT accumulation ({vol:.1f}x) [20 pts]')
+    elif 1.8 < vol <= 2.2:
+        score += 18
+        criteria.append(f'✅ Volume: Strong interest ({vol:.1f}x) [18 pts]')
+    elif 1.1 <= vol < 1.3:
+        score += 12
+        criteria.append(f'✅ Volume: Building ({vol:.1f}x) [12 pts]')
+    elif 2.2 < vol <= 2.8:
+        score += 8
+        criteria.append(f'⚠ Volume: High ({vol:.1f}x) [8 pts]')
+    elif vol > 3.0:
+        score += 0
+        criteria.append(f'❌ Volume: Too high - Distribution? ({vol:.1f}x) [0 pts]')
+    else:
+        score += 3
+        criteria.append(f'⚠ Volume: Low ({vol:.1f}x) [3 pts]')
+    
+    # 7. TODAY'S PRICE - STRICTER (15 pts)
+    if -1.5 <= change <= 0.3:
         score += 15
-        criteria.append(f'✅ Today: Perfect - Not moving yet ({change:+.1f}%) [15 pts]')
-    elif 0.5 < change <= 1.5:
+        criteria.append(f'✅ Today: PERFECT timing ({change:+.1f}%) [15 pts]')
+    elif 0.3 < change <= 1:
         score += 12
         criteria.append(f'✅ Today: Early move ({change:+.1f}%) [12 pts]')
-    elif -3 <= change < -2:
+    elif -2.5 <= change < -1.5:
         score += 10
-        criteria.append(f'✅ Today: Dip opportunity ({change:+.1f}%) [10 pts]')
-    elif change > 3:
+        criteria.append(f'✅ Today: Dip buy ({change:+.1f}%) [10 pts]')
+    elif 1 < change <= 2:
+        score += 5
+        criteria.append(f'⚠ Today: Moving ({change:+.1f}%) [5 pts]')
+    elif change > 2.5:
         score += 0
         criteria.append(f'❌ Today: Already rallied ({change:+.1f}%) [0 pts]')
     else:
-        score += 5
-        criteria.append(f'⚠ Today: Moderate ({change:+.1f}%) [5 pts]')
+        score += 3
+        criteria.append(f'⚠ Today: Weak ({change:+.1f}%) [3 pts]')
     
-    # 7. MONTHLY TREND - RECOVERING FROM DIP (15 pts)
-    if -10 <= monthly_change <= -2:
+    # 8. MONTHLY RECOVERY - STRICTER (15 pts)
+    if -8 <= monthly_change <= -2:
         score += 15
-        criteria.append(f'✅ Monthly: Recovering from dip ({monthly_change:+.1f}%) [15 pts]')
-    elif -2 < monthly_change <= 3:
+        criteria.append(f'✅ Monthly: PERFECT recovery ({monthly_change:+.1f}%) [15 pts]')
+    elif -2 < monthly_change <= 2:
         score += 12
         criteria.append(f'✅ Monthly: Base building ({monthly_change:+.1f}%) [12 pts]')
-    elif 3 < monthly_change <= 8:
-        score += 8
-        criteria.append(f'⚠ Monthly: Moderate gain ({monthly_change:+.1f}%) [8 pts]')
-    elif monthly_change > 12:
-        score += 0
-        criteria.append(f'❌ Monthly: Extended move ({monthly_change:+.1f}%) [0 pts]')
-    else:
-        score += 5
-        criteria.append(f'⚠ Monthly: Weak ({monthly_change:+.1f}%) [5 pts]')
-    
-    # 8. POTENTIAL UPSIDE (10 pts)
-    if potential_pct >= 10:
+    elif -12 <= monthly_change < -8:
         score += 10
-        criteria.append(f'✅ Upside: Excellent ({potential_pct:.1f}%) [10 pts]')
-    elif potential_pct >= 8:
+        criteria.append(f'✅ Monthly: Deep correction ({monthly_change:+.1f}%) [10 pts]')
+    elif 2 < monthly_change <= 5:
+        score += 5
+        criteria.append(f'⚠ Monthly: Moderate gain ({monthly_change:+.1f}%) [5 pts]')
+    elif monthly_change > 10:
+        score += 0
+        criteria.append(f'❌ Monthly: Extended ({monthly_change:+.1f}%) [0 pts]')
+    else:
+        score += 3
+        criteria.append(f'⚠ Monthly: Weak ({monthly_change:+.1f}%) [3 pts]')
+    
+    # 9. 3-MONTH TREND - NEW STRICTER CRITERIA (10 pts)
+    if -15 <= three_month_change <= -5:
+        score += 10
+        criteria.append(f'✅ 3-Month: Perfect correction ({three_month_change:+.1f}%) [10 pts]')
+    elif -5 < three_month_change <= 5:
+        score += 8
+        criteria.append(f'✅ 3-Month: Sideways ({three_month_change:+.1f}%) [8 pts]')
+    elif -25 <= three_month_change < -15:
+        score += 5
+        criteria.append(f'⚠ 3-Month: Deep fall ({three_month_change:+.1f}%) [5 pts]')
+    elif 5 < three_month_change <= 15:
+        score += 3
+        criteria.append(f'⚠ 3-Month: Some gain ({three_month_change:+.1f}%) [3 pts]')
+    elif three_month_change > 25:
+        score += 0
+        criteria.append(f'❌ 3-Month: Extended rally ({three_month_change:+.1f}%) [0 pts]')
+    else:
+        score += 2
+        criteria.append(f'⚠ 3-Month: Very weak ({three_month_change:+.1f}%) [2 pts]')
+    
+    # 10. UPSIDE POTENTIAL - STRICTER (10 pts)
+    if potential_pct >= 12:
+        score += 10
+        criteria.append(f'✅ Upside: EXCELLENT ({potential_pct:.1f}%) [10 pts]')
+    elif potential_pct >= 10:
         score += 8
         criteria.append(f'✅ Upside: Very Good ({potential_pct:.1f}%) [8 pts]')
-    elif potential_pct >= 6:
+    elif potential_pct >= 8:
         score += 5
         criteria.append(f'⚠ Upside: Good ({potential_pct:.1f}%) [5 pts]')
     else:
         score += 0
         criteria.append(f'❌ Upside: Low ({potential_pct:.1f}%) [0 pts]')
     
-    # Rating based on EARLY BUY criteria
-    if is_operated:
-        status = '🚨 OPERATED - AVOID'
-        rating = 'Operated - Avoid'
-    elif score >= 100:
+    # FINAL RATING - ULTRA STRICT
+    if is_operated or not fundamental_pass:
+        status = '🚨 REJECTED'
+        rating = 'Rejected'
+    elif score >= 140:
+        status = '🌟 EXCEPTIONAL BUY'
+        rating = 'Exceptional Buy'
+    elif score >= 125:
         status = '🚀 PRIME BUY'
         rating = 'Prime Buy'
-    elif score >= 90:
-        status = '🌟 EXCELLENT BUY'
+    elif score >= 110:
+        status = '💎 EXCELLENT BUY'
         rating = 'Excellent Buy'
-    elif score >= 80:
-        status = '💎 STRONG BUY'
+    elif score >= 95:
+        status = '✅ STRONG BUY'
         rating = 'Strong Buy'
-    elif score >= 70:
-        status = '✅ GOOD BUY'
+    elif score >= 80:
+        status = '👍 GOOD BUY'
         rating = 'Good Buy'
     elif score >= 60:
-        status = '👍 WATCHLIST'
+        status = '⚠️ WATCHLIST'
         rating = 'Watchlist'
     else:
         status = '❌ SKIP'
         rating = 'Skip'
     
-    qualified = score >= 80 and not is_operated  # Only qualify safe, excellent opportunities
+    qualified = score >= 110 and not is_operated and fundamental_pass
     met_count = len([c for c in criteria if '✅' in c])
     
     return {
@@ -541,6 +576,7 @@ def analyze_stock(data, criteria_config):
         'change': change,
         'weekly_change': weekly_change,
         'monthly_change': monthly_change,
+        'three_month_change': three_month_change,
         'potential_rs': potential_rs,
         'potential_pct': potential_pct,
         'rsi': rsi,
@@ -557,12 +593,16 @@ def analyze_stock(data, criteria_config):
         'sector': SECTOR_MAP.get(data['symbol'], 'Other'),
         'is_operated': is_operated,
         'operator_risk': operator_risk,
-        'operator_flags': operator_flags
+        'operator_flags': operator_flags,
+        'market_cap': market_cap,
+        'revenue_growth': revenue_growth,
+        'profit_margin': profit_margin,
+        'earnings_growth': earnings_growth
     }
 
 # Main App
-st.markdown('<p class="main-header">🎯 Indian Stock Scout - EARLY BUY Scanner</p>', unsafe_allow_html=True)
-st.markdown("*Find stocks BEFORE they rally - Early accumulation opportunities*")
+st.markdown('<p class="main-header">🎯 Indian Stock Scout - ELITE Early Buy Scanner</p>', unsafe_allow_html=True)
+st.markdown("*Find top 2-5% quality stocks BEFORE they rally - Fundamental + Technical perfection*")
 
 # Sidebar
 st.sidebar.header("⚙ Scanner Configuration")
@@ -580,22 +620,27 @@ else:
     stocks_to_scan = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 ULTRA-STRICT Criteria")
+st.sidebar.subheader("🎯 ULTRA-STRICT Criteria + Fundamentals")
 st.sidebar.info("""
-*Only top 5-10% qualify:*
-- Qualified: Score ≥110 + Safe
-- Exceptional: ≥140
-- Prime: 125-139
-- Excellent: 110-124
-- Strong: 95-109
+*FUNDAMENTAL FILTERS (MUST PASS):*
+1. **Market Cap ≥ ₹1,000 Cr**
+   - Avoid penny stocks
+2. **Revenue Growth ≥ 10%**
+   - YoY growth requirement
+3. **Profit Margin ≥ 5%**
+   - Must be profitable
+4. **Earnings Growth ≥ 15%**
+   - Strong earnings momentum
+5. **ROE ≥ 12%**
+   - Capital efficiency
 
-*10 STRICT Criteria (190 pts):*
-1. **FII/DII Activity (30 pts)**
-   - Institutional buying signals
+*TECHNICAL CRITERIA (190 pts):*
+1. **FII/DII (30 pts)**
+   - Institutional buying ≥12
 2. **Consolidation (25 pts)**
    - -2% to +0.5% weekly
 3. **RSI (25 pts)**
-   - 32-38 (perfect oversold)
+   - 32-38 (oversold)
 4. **MACD (20 pts)**
    - -1 to +1 (crossover)
 5. **BB (20 pts)**
@@ -605,16 +650,18 @@ st.sidebar.info("""
 7. **Today (15 pts)**
    - -1.5% to +0.3%
 8. **Monthly (15 pts)**
-   - -8% to -2% (recovery)
+   - -8% to -2%
 9. **3-Month (10 pts)**
-   - Performance check
+   - -15% to +5%
 10. **Upside (10 pts)**
     - ≥12% potential
 
-*Operator Penalties:*
-- Operated: -70 pts
-- Very High Risk: -40 pts
-- High Risk: -25 pts
+*QUALIFICATION:*
+- Exceptional: ≥140 + Fundamentals
+- Prime: 125-139 + Fundamentals
+- Excellent: 110-124 + Fundamentals
+
+*Expect only 2-5% to qualify!*
 """)
 
 st.sidebar.markdown("---")
@@ -622,9 +669,9 @@ st.sidebar.markdown("---")
 if 'scan_results' not in st.session_state:
     st.session_state.scan_results = None
 
-if st.sidebar.button("🚀 FIND EARLY BUYS", type="primary", use_container_width=True):
+if st.sidebar.button("🚀 FIND ELITE BUYS", type="primary", use_container_width=True):
     st.markdown("---")
-    st.subheader("📊 Scanning for Early Buy Opportunities...")
+    st.subheader("📊 Scanning for Elite Early Buy Opportunities...")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -637,7 +684,7 @@ if st.sidebar.button("🚀 FIND EARLY BUYS", type="primary", use_container_width
     criteria_config = {}  # Using hardcoded strict criteria
     
     for idx, symbol in enumerate(stocks_to_scan):
-        status_text.info(f"📊 Fetching *{symbol}*... ({idx+1}/{total})")
+        status_text.info(f"📊 Fetching {symbol}... ({idx+1}/{total})")
         
         data = fetch_stock_data(symbol)
         if data:
@@ -652,7 +699,7 @@ if st.sidebar.button("🚀 FIND EARLY BUYS", type="primary", use_container_width
         
         if (idx + 1) % 10 == 0 or idx == total - 1:
             qualified_count = len([r for r in results if r['qualified']])
-            stats_placeholder.info(f"✅ Analyzed: {len(results)} | Qualified (≥80): {qualified_count} | Failed: {failed}")
+            stats_placeholder.info(f"✅ Analyzed: {len(results)} | Qualified (≥110): {qualified_count} | Failed: {failed}")
         
         time.sleep(0.15)
     
@@ -686,7 +733,7 @@ if st.session_state.scan_results:
             seconds_ago = int((datetime.now() - st.session_state.last_refresh).total_seconds())
             st.caption(f"Updated {seconds_ago}s ago")
     
-    st.subheader(f"📈 Early Buy Opportunities Found")
+    st.subheader(f"📈 Elite Early Buy Opportunities Found")
     st.caption(f"Initial scan: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Auto-refresh logic
@@ -717,6 +764,10 @@ if st.session_state.scan_results:
         'Weekly (%)': r['weekly_change'],
         'Monthly (%)': r['monthly_change'],
         '3M (%)': r['three_month_change'],
+        'MCap (Cr)': r['market_cap'] / 1e7 if r.get('market_cap', 0) > 0 else 0,
+        'Rev Growth (%)': r.get('revenue_growth', 0) if r.get('revenue_growth') is not None else 0,
+        'Profit Margin (%)': r.get('profit_margin', 0) if r.get('profit_margin') is not None else 0,
+        'Earnings Growth (%)': r.get('earnings_growth', 0) if r.get('earnings_growth') is not None else 0,
         'FII/DII': r['fii_dii_score'],
         'Potential (₹)': r['potential_rs'],
         'Potential (%)': r['potential_pct'],
@@ -754,8 +805,8 @@ if st.session_state.scan_results:
     # Show qualification summary
     qualified_total = len(exceptional) + len(prime) + len(excellent)
     st.info(f"""
-    **🎯 QUALIFICATION SUMMARY:** Only **{qualified_total}** stocks qualified (Score ≥110 + Safe) out of {len(df)} scanned.
-    These are the **top {(qualified_total/len(df)*100):.1f}%** - truly exceptional early buy opportunities!
+    **🎯 QUALIFICATION SUMMARY:** Only **{qualified_total}** stocks qualified (Score ≥110 + Safe + Fundamentals) out of {len(df)} scanned.
+    These are the **top {(qualified_total/len(df)*100):.1f}%** - truly exceptional early buy opportunities with strong fundamentals!
     """)
     
     st.markdown("---")
@@ -767,7 +818,7 @@ if st.session_state.scan_results:
     
     with filter_col1:
         rating_filter = st.selectbox("Rating", 
-            ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip", "Operated - Avoid"])
+            ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip", "Rejected"])
     
     with filter_col2:
         safety_filter = st.selectbox("Safety", 
@@ -804,7 +855,7 @@ if st.session_state.scan_results:
     
     filtered_df = filtered_df[filtered_df['Score'] >= min_score_filter]
     
-    st.info(f"📊 Showing *{len(filtered_df)}* stocks (filtered from {len(df)} total)")
+    st.info(f"📊 Showing {len(filtered_df)} stocks (filtered from {len(df)} total)")
     
     # OPERATOR WARNING
     if len(operated_stocks) > 0:
@@ -842,6 +893,10 @@ if st.session_state.scan_results:
             'Weekly (%)': '{:+.2f}%',
             'Monthly (%)': '{:+.2f}%',
             '3M (%)': '{:+.2f}%',
+            'MCap (Cr)': '₹{:.0f}',
+            'Rev Growth (%)': '{:.1f}%',
+            'Profit Margin (%)': '{:.1f}%',
+            'Earnings Growth (%)': '{:.1f}%',
             'Potential (₹)': '₹{:.2f}',
             'Potential (%)': '{:.2f}%',
             'RSI': '{:.1f}',
@@ -854,7 +909,7 @@ if st.session_state.scan_results:
     # Show only qualified stocks by default message
     if min_score_filter == 110:
         st.success("""
-        ✅ **Showing QUALIFIED stocks only (Score ≥110)**. These are the best early buy opportunities.
+        ✅ **Showing QUALIFIED stocks only (Score ≥110 + Fundamentals)**. These are the best early buy opportunities.
         Lower the 'Min Score' filter if you want to see all stocks.
         """)
     
@@ -890,9 +945,9 @@ if st.session_state.scan_results:
             col1, col2, col3, col4, col5, col6 = st.columns(6)
             col1.metric("Score", selected_result['score'])
             col2.metric("Price", f"₹{selected_result['price']:.2f}")
-            col3.metric("Today", f"{selected_result['change']:+.2f}%")
-            col4.metric("Weekly", f"{selected_result['weekly_change']:+.2f}%")
-            col5.metric("Potential", f"₹{selected_result['potential_rs']:.2f}")
+            col3.metric("MCap", f"₹{selected_result.get('market_cap', 0) / 1e7:.0f} Cr")
+            col4.metric("Rev Growth", f"{selected_result.get('revenue_growth', 0):.1f}%" if selected_result.get('revenue_growth') else "N/A")
+            col5.metric("Earnings", f"{selected_result.get('earnings_growth', 0):.1f}%" if selected_result.get('earnings_growth') else "N/A")
             col6.metric("Risk Score", f"{selected_result['operator_risk']}/100")
             
             st.markdown("#### Detailed Scoring Breakdown")
@@ -917,7 +972,7 @@ if st.session_state.scan_results:
         st.download_button(
             "📥 Download Filtered CSV",
             csv,
-            f"early_buy_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            f"elite_buy_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "text/csv",
             use_container_width=True
         )
@@ -927,132 +982,387 @@ if st.session_state.scan_results:
         st.download_button(
             "📥 Download All Results CSV",
             all_csv,
-            f"early_buy_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            f"elite_buy_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "text/csv",
             use_container_width=True
         )
 
 else:
-    st.info("👈 Configure and click 'FIND EARLY BUYS' to start scanning")
+    st.info("👈 Configure and click 'FIND ELITE BUYS' to start scanning")
     
     st.markdown("---")
-    st.subheader("🎯 ULTRA-STRICT Strategy - Only Top 5-10% Qualify")
+    st.subheader("🎯 ULTRA-STRICT Strategy + FUNDAMENTALS - Only Top 2-5% Qualify")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("""
-        **Why ULTRA-STRICT Works:**
+        **🏦 NEW: FUNDAMENTAL FILTERS (MUST PASS):**
         
-        **Find Hidden Gems BEFORE Rally:**
-        - Out of 100+ stocks, only 5-10 qualify
-        - Catch them during consolidation
-        - Enter during accumulation phase
-        - Highest probability setups only
+        **Why Fundamentals Matter:**
+        - Separate quality from junk
+        - Avoid manipulation-prone stocks
+        - Focus on growing businesses
+        - Reduce downside risk
         
-        **Key Philosophy:**
-        1. ❌ **Don't Chase:** Stocks up 3%+ today
-        2. ❌ **Don't FOMO:** RSI >55, already moving
-        3. ✅ **Do Buy:** RSI 32-45, turning bullish
-        4. ✅ **Do Wait:** For perfect setup only
+        **5 MANDATORY FILTERS:**
         
-        **🚨 OPERATOR PROTECTION:**
+        **1. Market Cap ≥ ₹1,000 Crores**
+        - Avoid penny stocks
+        - Better liquidity
+        - Lower manipulation risk
+        - More institutional interest
+        
+        **2. Revenue Growth ≥ 10% YoY**
+        - Growing businesses only
+        - Sustainable competitive advantage
+        - Market share gains
+        - Reject declining companies
+        
+        **3. Profit Margin ≥ 5%**
+        - Must be profitable
+        - Operating efficiency
+        - Pricing power
+        - Sustainable business model
+        
+        **4. Earnings Growth ≥ 15% YoY**
+        - Strong earnings momentum
+        - Better than revenue growth
+        - Operational leverage
+        - Quality of growth
+        
+        **5. ROE ≥ 12%**
+        - Capital efficiency
+        - Management quality
+        - Competitive moat
+        - Value creation
+        
+        **⚠️ If ANY fundamental filter fails:**
+        - **INSTANT REJECTION** (-100 score)
+        - No technical analysis needed
+        - Move to next stock
+        
+        **🚨 OPERATOR PROTECTION (Enhanced):**
         - 8 manipulation detection signals
-        - -70 pts penalty for operated stocks
+        - -70 pts for confirmed operators
+        - -40 pts for very high risk
+        - -25 pts for high risk
         - Auto-identifies pump & dump
-        
-        **🏦 FII/DII Activity (30 pts) - NEW!**
-        - Detects institutional buying/selling
-        - High volume + price up = Buying
-        - Confirms smart money interest
-        - Score ≥12: Strong buying
-        - Score ≤-8: Selling (avoid)
-        
-        **1. Consolidation (25 pts)**
-           - Perfect: -2% to +0.5% weekly
-           - Reject: >2% weekly rally
-        
-        **2. RSI (25 pts)**
-           - Perfect: 32-38 (oversold)
-           - Good: 38-45 (building)
-           - Reject: >55 (overbought)
-        
-        **3. MACD (20 pts)**
-           - Perfect: -1 to +1 (crossover)
-           - Reject: >5 (extended)
         """)
     
     with col2:
         st.markdown("""        
-        **4. Bollinger Bands (20 pts)**
-           - Perfect: 8-20% (lower band)
-           - Good: 20-30% (below middle)
-           - Reject: >60% (upper band)
+        **📊 TECHNICAL CRITERIA (190 pts):**
         
-        **5. Volume (20 pts)**
-           - Perfect: 1.3-1.8x (accumulation)
-           - Good: 1.8-2.2x (interest)
-           - Reject: >2.8x (distribution)
+        *Now applied ONLY after fundamentals pass*
         
-        **6. Today's Price (15 pts)**
+        **1. FII/DII Activity (30 pts) - STRICTER**
+           - Perfect: ≥15 pts (strong buying)
+           - Good: 12-14 pts
+           - Moderate: 8-11 pts
+           - Reject: Selling (≤-8)
+        
+        **2. Consolidation (25 pts) - STRICTER**
+           - Perfect: -2% to +0.5% weekly
+           - Good: -3% to -2% OR +0.5% to +1%
+           - Reject: >+3% (already rallied)
+        
+        **3. RSI (25 pts) - STRICTER**
+           - Perfect: 32-38 (deep oversold)
+           - Good: 38-45
+           - Reject: >60 (overbought)
+        
+        **4. MACD (20 pts) - STRICTER**
+           - Perfect: -1 to +1 (crossover zone)
+           - Good: -2 to +2
+           - Reject: >6 (extended)
+        
+        **5. Bollinger Bands (20 pts) - STRICTER**
+           - Perfect: 8-20% (deep lower band)
+           - Good: 20-30%
+           - Reject: >65% (upper band)
+        
+        **6. Volume (20 pts) - STRICTER**
+           - Perfect: 1.3-1.8x (smart accumulation)
+           - Good: 1.8-2.2x
+           - Reject: >3.0x (distribution)
+        
+        **7. Today's Price (15 pts) - STRICTER**
            - Perfect: -1.5% to +0.3%
+           - Good: +0.3% to +1%
            - Reject: >2.5% (chasing)
         
-        **7. Monthly Recovery (15 pts)**
-           - Perfect: -8% to -2% (recovery)
-           - Good: -2% to +2% (base)
+        **8. Monthly Recovery (15 pts) - STRICTER**
+           - Perfect: -8% to -2% (recovery phase)
+           - Good: -2% to +2%
            - Reject: >10% (extended)
         
-        **8. 3-Month Performance (10 pts)**
+        **9. 3-Month Trend (10 pts) - NEW**
            - Perfect: -15% to -5% (correction)
            - Good: -5% to +5% (sideways)
-           - Reject: >25% (extended)
+           - Reject: >25% (too extended)
         
-        **9. Upside Potential (10 pts)**
-           - Target: ≥12% move
-           - Minimum: 10%
+        **10. Upside Potential (10 pts)**
+           - Perfect: ≥12%
+           - Good: 10-12%
+           - Reject: <8%
         
-        **QUALIFICATION:**
-        - Exceptional: ≥140 pts
-        - Prime: 125-139 pts
-        - Excellent: 110-124 pts (QUALIFIED)
-        - Strong: 95-109 pts
-        - Below 95: Not good enough
+        **🎯 QUALIFICATION THRESHOLDS:**
+        - **Exceptional:** ≥140 pts + All fundamentals
+        - **Prime:** 125-139 pts + All fundamentals
+        - **Excellent:** 110-124 pts + All fundamentals (QUALIFIED)
+        - **Strong:** 95-109 pts + All fundamentals
+        - **Below 95 or failed fundamentals:** REJECTED
         """)
     
     st.markdown("---")
     st.error("""
-    **⚠️ ULTRA-STRICT = ONLY THE BEST:**
+    **⚠️ EXPECT ULTRA-LOW QUALIFICATION RATE:**
     
-    With these criteria, expect:
-    - **5-10 stocks** out of 100 to qualify (5-10%)
-    - **1-3 exceptional** opportunities (score ≥140)
-    - **2-5 prime/excellent** opportunities (score 110-139)
-    - **Rest rejected** as not meeting standards
+    With fundamental + technical filters:
+    - **2-5 stocks** out of 100 qualify (2-5%)
+    - **0-2 exceptional** opportunities (≥140)
+    - **1-3 prime/excellent** opportunities (110-139)
+    - **95-98% REJECTED** as not meeting standards
     
-    This is INTENTIONAL - we want only the highest probability setups!
+    **This is INTENTIONAL!** We're finding:
+    - Top-tier businesses (fundamentals)
+    - Perfect technical setup (technicals)
+    - Safe from manipulation (operator detection)
+    - BEFORE the 10%+ rally (early entry)
     """)
     
     st.info("""
-    **🎯 BOTTOM LINE:** 
+    **🎯 THE ULTIMATE EDGE:** 
     
-    This scanner finds the TOP 5-10% of stocks that are:
-    - **Consolidating** (not rallying yet)
-    - **Oversold** (RSI 32-45)
-    - **Turning bullish** (MACD crossover)
-    - **Near support** (BB 8-30%)
-    - **Being accumulated** by institutions
-    - **NOT OPERATED** (100% safe)
+    This scanner finds the TOP 2-5% of stocks that have:
     
-    **Perfect Entry = Top 5-10% opportunities ONLY + BEFORE 10%+ move**
+    **✅ FUNDAMENTAL QUALITY:**
+    - ≥₹1,000 Cr market cap (institutional grade)
+    - ≥10% revenue growth (growing business)
+    - ≥5% profit margin (profitable)
+    - ≥15% earnings growth (strong momentum)
+    - ≥12% ROE (efficient capital use)
     
-    **Auto-Refresh:** Enable the checkbox after scan to get live price updates every 10 seconds!
+    **✅ TECHNICAL SETUP:**
+    - Consolidating (not rallying yet)
+    - Oversold (RSI 32-45)
+    - Turning bullish (MACD crossover)
+    - Near support (BB 8-30%)
+    - Being accumulated (Volume 1.3-1.8x)
+    - Institutional interest (FII/DII ≥12)
+    
+    **✅ SAFETY:**
+    - NOT OPERATED (operator detection)
+    - Clean price action
+    - Sustainable growth
+    
+    **Perfect Entry = Top 2-5% Quality Businesses at Perfect Technical Timing**
+    
+    **Auto-Refresh:** Enable after scan for live updates every 10 seconds!
     """)
 
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center;color:#666;'>
-<p><strong>Indian Stock Scout - ULTRA-STRICT MODE</strong> | Only Top 5-10% Qualify | Auto-Refresh Available</p>
+<p><strong>Indian Stock Scout - ELITE MODE</strong> | Only Top 2-5% Qualify | Fundamentals + Technicals | Auto-Refresh Available</p>
 <p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice. Past performance doesn't guarantee future results.</p>
 </div>
 """, unsafe_allow_html=True)
+        return 'Sideways'
+
+def analyze_stock(data, criteria_config):
+    """Analyze stock to find EARLY BUY opportunities BEFORE rally - ULTRA STRICT MODE"""
+    if not data:
+        return None
+    
+    price = data['price']
+    change = data['change']
+    rsi = data['rsi']
+    macd = data['macd']
+    bb = data['bb_position']
+    vol = data['vol_multiple']
+    trend = data['trend']
+    closes = data['closes']
+    
+    # Fundamental data
+    market_cap = data.get('market_cap', 0)
+    revenue_growth = data.get('revenue_growth', None)
+    profit_margin = data.get('profit_margin', None)
+    earnings_growth = data.get('earnings_growth', None)
+    operating_margin = data.get('operating_margin', None)
+    roe = data.get('roe', None)
+    debt_to_equity = data.get('debt_to_equity', None)
+    
+    # OPERATOR DETECTION - Critical Safety Check
+    is_operated, operator_flags, operator_risk = detect_operator_activity(data)
+    
+    # Calculate additional indicators for early detection
+    weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
+    monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
+    three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 else 0
+    
+    potential_rs = max(20, price * 0.08)
+    potential_pct = (potential_rs / price) * 100
+    
+    score = 0
+    criteria = []
+    
+    # ===== FUNDAMENTAL FILTERS (MUST PASS) =====
+    fundamental_pass = True
+    
+    # 1. MARKET CAP FILTER - Avoid penny stocks and manipulation-prone small caps
+    market_cap_cr = market_cap / 1e7 if market_cap > 0 else 0  # Convert to Crores
+    
+    if market_cap < 1000_00_00_000:  # Less than 1000 Cr
+        criteria.append(f'❌ REJECTED: Market Cap too low (₹{market_cap_cr:.0f} Cr) - High manipulation risk')
+        fundamental_pass = False
+    elif market_cap < 5000_00_00_000:  # 1000-5000 Cr
+        criteria.append(f'⚠️ Small Cap: ₹{market_cap_cr:.0f} Cr - Higher risk')
+    elif market_cap < 20000_00_00_000:  # 5000-20000 Cr
+        criteria.append(f'✅ Mid Cap: ₹{market_cap_cr:.0f} Cr - Good')
+    else:  # >20000 Cr
+        criteria.append(f'✅ Large Cap: ₹{market_cap_cr:.0f} Cr - Excellent')
+    
+    # 2. REVENUE GROWTH FILTER (Critical for growth stocks)
+    if revenue_growth is not None:
+        if revenue_growth < 10:
+            criteria.append(f'❌ REJECTED: Revenue Growth too low ({revenue_growth:.1f}%) - Need ≥10%')
+            fundamental_pass = False
+        elif revenue_growth < 15:
+            criteria.append(f'⚠️ Revenue Growth: Moderate ({revenue_growth:.1f}%) - Borderline')
+        elif revenue_growth < 25:
+            criteria.append(f'✅ Revenue Growth: Good ({revenue_growth:.1f}%)')
+        else:
+            criteria.append(f'✅ Revenue Growth: EXCELLENT ({revenue_growth:.1f}%)')
+    else:
+        criteria.append(f'⚠️ Revenue Growth: Data N/A')
+    
+    # 3. PROFIT MARGIN FILTER (Must be profitable)
+    if profit_margin is not None:
+        if profit_margin < 5:
+            criteria.append(f'❌ REJECTED: Profit Margin too low ({profit_margin:.1f}%) - Need ≥5%')
+            fundamental_pass = False
+        elif profit_margin < 10:
+            criteria.append(f'⚠️ Profit Margin: Low ({profit_margin:.1f}%)')
+        elif profit_margin < 15:
+            criteria.append(f'✅ Profit Margin: Good ({profit_margin:.1f}%)')
+        else:
+            criteria.append(f'✅ Profit Margin: EXCELLENT ({profit_margin:.1f}%)')
+    else:
+        criteria.append(f'⚠️ Profit Margin: Data N/A')
+    
+    # 4. EARNINGS GROWTH FILTER
+    if earnings_growth is not None:
+        if earnings_growth < 15:
+            criteria.append(f'❌ REJECTED: Earnings Growth too low ({earnings_growth:.1f}%) - Need ≥15%')
+            fundamental_pass = False
+        elif earnings_growth < 20:
+            criteria.append(f'⚠️ Earnings Growth: Moderate ({earnings_growth:.1f}%)')
+        elif earnings_growth < 30:
+            criteria.append(f'✅ Earnings Growth: Good ({earnings_growth:.1f}%)')
+        else:
+            criteria.append(f'✅ Earnings Growth: EXCELLENT ({earnings_growth:.1f}%)')
+    else:
+        criteria.append(f'⚠️ Earnings Growth: Data N/A')
+    
+    # 5. ROE FILTER (Return on Equity)
+    if roe is not None:
+        if roe < 12:
+            criteria.append(f'❌ REJECTED: ROE too low ({roe:.1f}%) - Need ≥12%')
+            fundamental_pass = False
+        elif roe < 15:
+            criteria.append(f'⚠️ ROE: Moderate ({roe:.1f}%)')
+        elif roe < 20:
+            criteria.append(f'✅ ROE: Good ({roe:.1f}%)')
+        else:
+            criteria.append(f'✅ ROE: EXCELLENT ({roe:.1f}%)')
+    else:
+        criteria.append(f'⚠️ ROE: Data N/A')
+    
+    # If fundamentals don't pass, reject immediately
+    if not fundamental_pass:
+        return {
+            'symbol': data['symbol'],
+            'price': price,
+            'change': change,
+            'weekly_change': weekly_change,
+            'monthly_change': monthly_change,
+            'three_month_change': three_month_change,
+            'potential_rs': potential_rs,
+            'potential_pct': potential_pct,
+            'rsi': rsi,
+            'macd': macd,
+            'bb': bb,
+            'vol': vol,
+            'trend': trend,
+            'score': -100,
+            'qualified': False,
+            'status': '❌ REJECTED - Fundamentals',
+            'rating': 'Rejected',
+            'criteria': criteria,
+            'met_count': 0,
+            'sector': SECTOR_MAP.get(data['symbol'], 'Other'),
+            'is_operated': is_operated,
+            'operator_risk': operator_risk,
+            'operator_flags': operator_flags,
+            'market_cap': market_cap,
+            'revenue_growth': revenue_growth,
+            'profit_margin': profit_margin,
+            'earnings_growth': earnings_growth
+        }
+    
+    # ===== TECHNICAL SCORING (ULTRA STRICT) =====
+    
+    # CRITICAL: Penalize heavily for operator activity
+    if is_operated:
+        score -= 70
+        criteria.append(f'🚨 OPERATOR DETECTED: Risk Score {operator_risk}/100 - AVOID [-70 pts]')
+    elif operator_risk >= 35:
+        score -= 40
+        criteria.append(f'⚠️ VERY HIGH RISK: Manipulation signs (Risk: {operator_risk}/100) [-40 pts]')
+    elif operator_risk >= 20:
+        score -= 25
+        criteria.append(f'⚠️ HIGH RISK: Manipulation indicators (Risk: {operator_risk}/100) [-25 pts]')
+    elif operator_risk >= 10:
+        score -= 10
+        criteria.append(f'⚠️ CAUTION: Some risk signals (Risk: {operator_risk}/100) [-10 pts]')
+    
+    # 1. FII/DII INSTITUTIONAL ACTIVITY (30 pts) - STRICTER
+    fii_score = data['fii_dii_score']
+    if fii_score >= 15:
+        score += 30
+        criteria.append(f'✅ FII/DII: STRONG buying ({fii_score} pts) [30 pts]')
+    elif fii_score >= 12:
+        score += 25
+        criteria.append(f'✅ FII/DII: Good buying ({fii_score} pts) [25 pts]')
+    elif fii_score >= 8:
+        score += 18
+        criteria.append(f'✅ FII/DII: Moderate buying ({fii_score} pts) [18 pts]')
+    elif fii_score >= 4:
+        score += 10
+        criteria.append(f'⚠ FII/DII: Weak activity ({fii_score} pts) [10 pts]')
+    elif fii_score <= -8:
+        score += 0
+        criteria.append(f'❌ FII/DII: Selling detected ({fii_score} pts) [0 pts]')
+    else:
+        score += 5
+        criteria.append(f'⚠ FII/DII: Neutral ({fii_score} pts) [5 pts]')
+    
+    # 2. CONSOLIDATION PHASE (25 pts) - STRICTER
+    if -2 <= weekly_change <= 0.5:
+        score += 25
+        criteria.append(f'✅ Consolidation: Perfect base ({weekly_change:+.1f}% weekly) [25 pts]')
+    elif 0.5 < weekly_change <= 1:
+        score += 20
+        criteria.append(f'✅ Consolidation: Early breakout ({weekly_change:+.1f}% weekly) [20 pts]')
+    elif -3 <= weekly_change < -2:
+        score += 18
+        criteria.append(f'✅ Consolidation: Healthy pullback ({weekly_change:+.1f}% weekly) [18 pts]')
+    elif 1 < weekly_change <= 2:
+        score += 10
+        criteria.append(f'⚠ Consolidation: Moving up ({weekly_change:+.1f}% weekly) [10 pts]')
+    elif weekly_change > 3:
+        score += 0
+        criteria.append(f'❌ Already rallied: Too late ({weekly_change:+.1f}% weekly) [0 pts]')
+    else:
