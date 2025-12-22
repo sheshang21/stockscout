@@ -138,10 +138,18 @@ def fetch_stock_data(symbol):
         vol_multiple = calculate_volume_multiple(volumes)
         trend = detect_trend(closes)
         
+        # Calculate timeframe changes
+        weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
+        monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
+        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 else 0
+        
         return {
             'symbol': symbol,
             'price': price,
             'change': change,
+            'weekly_change': weekly_change,
+            'monthly_change': monthly_change,
+            'three_month_change': three_month_change,
             'rsi': rsi,
             'macd': macd,
             'bb_position': bb_position,
@@ -828,11 +836,14 @@ if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_contain
         progress_bar.progress(progress)
         
         if (idx + 1) % 10 == 0 or idx == total - 1:
-            qualified_count = len([r for r in results if r['qualified']])
-            stats_placeholder.info(f"✅ Analyzed: {len(results)} | Qualified (≥140): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
+            valid_results_count = len([r for r in results if r is not None])
+            qualified_count = len([r for r in results if r is not None and r['qualified']])
+            stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥140): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
         
         time.sleep(0.2)
     
+    # Filter out None results before storing
+    results = [r for r in results if r is not None]
     st.session_state.scan_results = results
     st.session_state.scan_timestamp = datetime.now()
     
@@ -898,7 +909,6 @@ if st.session_state.scan_results:
         'Profit YoY (%)': r['yoy_profit_growth'],
         'Profit QoQ (%)': r['qoq_profit_growth'],
         'Margin (%)': r['profit_margin'],
-        'FII/DII': r['fii_dii_score'],
         'RSI': r['rsi'],
         'MACD': r['macd'],
         'BB (%)': r['bb'],
