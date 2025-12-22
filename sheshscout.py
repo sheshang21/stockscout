@@ -866,34 +866,62 @@ if st.session_state.scan_results:
     col_refresh1, col_refresh2, col_refresh3 = st.columns([2, 2, 6])
     
     with col_refresh1:
-        auto_refresh = st.checkbox("🔄 Auto-refresh prices", value=False)
+        auto_refresh = st.checkbox("🔄 Auto-refresh prices", value=False, 
+                                   help="Continuously update prices every 30 seconds without resetting")
     
     with col_refresh2:
         if 'last_refresh' in st.session_state:
             seconds_ago = int((datetime.now() - st.session_state.last_refresh).total_seconds())
-            st.caption(f"Updated {seconds_ago}s ago")
+            st.caption(f"📡 Updated {seconds_ago}s ago")
+        else:
+            st.caption("📡 Not refreshed yet")
+    
+    with col_refresh3:
+        if auto_refresh:
+            if st.button("⏸️ Pause Refresh"):
+                st.session_state.auto_refresh_paused = True
+                st.rerun()
     
     st.subheader(f"📈 Exceptional Stock Opportunities")
-    st.caption(f"Scan time: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"Initial scan: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Auto-refresh logic
-    if auto_refresh:
+    # Auto-refresh logic - NON-BLOCKING
+    if auto_refresh and not st.session_state.get('auto_refresh_paused', False):
+        # Initialize refresh counter
         if 'refresh_counter' not in st.session_state:
             st.session_state.refresh_counter = 0
+            st.session_state.last_refresh = datetime.now()
         
-        if st.session_state.refresh_counter % 10 == 0:
-            with st.spinner("Refreshing..."):
+        # Check if 30 seconds have passed
+        time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
+        
+        if time_since_refresh >= 30:
+            # Update prices in background
+            with st.spinner("🔄 Refreshing live prices..."):
+                updated_count = 0
                 for result in results:
                     new_price = fetch_live_price(result['symbol'])
-                    if new_price:
-                        old_price = result['price']
+                    if new_price and new_price != result['price']:
+                        prev_price = result['price']
                         result['price'] = new_price
-                        result['change'] = ((new_price - old_price) / old_price) * 100
+                        result['change'] = ((new_price - prev_price) / prev_price) * 100
+                        updated_count += 1
+                
                 st.session_state.last_refresh = datetime.now()
-        
-        st.session_state.refresh_counter += 1
-        time.sleep(1)
-        st.rerun()
+                st.session_state.refresh_counter += 1
+                
+                if updated_count > 0:
+                    st.toast(f"✅ Updated {updated_count} prices", icon="🔄")
+            
+            # Force re-render
+            time.sleep(1)
+            st.rerun()
+        else:
+            # Schedule next refresh
+            remaining = 30 - time_since_refresh
+            st.info(f"⏱️ Next refresh in {int(remaining)} seconds...")
+            time.sleep(5)  # Check every 5 seconds
+            st.rerun()
     
     # Convert to DataFrame
     df = pd.DataFrame([{
