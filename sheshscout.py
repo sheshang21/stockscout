@@ -146,6 +146,133 @@ def calculate_volume_multiple(volumes):
         return 1.0
     return current / avg20
 
+def detect_operator_activity(data):
+    """
+    Detect if stock shows signs of operator/manipulator activity
+    Returns: (is_operated, warning_flags, risk_score)
+    """
+    closes = data['closes']
+    volumes = data['volumes']
+    highs = data['highs']
+    lows = data['lows']
+    
+    warning_flags = []
+    risk_score = 0
+    
+    if len(closes) < 20:
+        return False, [], 0
+    
+    # 1. EXTREME VOLUME SPIKES (Classic pump signal)
+    recent_vols = volumes[-10:]
+    avg_vol = np.mean(volumes[-60:]) if len(volumes) >= 60 else np.mean(volumes)
+    max_recent_vol = np.max(recent_vols)
+    
+    if max_recent_vol > avg_vol * 5:
+        warning_flags.append("🚨 EXTREME volume spike (>5x avg) - Possible pump")
+        risk_score += 30
+    elif max_recent_vol > avg_vol * 3:
+        warning_flags.append("⚠️ High volume spike (>3x avg) - Monitor closely")
+        risk_score += 15
+    
+    # 2. PRICE VOLATILITY WITHOUT NEWS (Manipulation indicator)
+    recent_prices = closes[-10:]
+    price_swings = []
+    for i in range(1, len(recent_prices)):
+        swing = abs((recent_prices[i] - recent_prices[i-1]) / recent_prices[i-1]) * 100
+        price_swings.append(swing)
+    
+    avg_swing = np.mean(price_swings) if price_swings else 0
+    max_swing = np.max(price_swings) if price_swings else 0
+    
+    if max_swing > 8 and avg_swing > 3:
+        warning_flags.append("🚨 Extreme volatility (>8% swings) - Operator activity likely")
+        risk_score += 25
+    elif max_swing > 5 and avg_swing > 2:
+        warning_flags.append("⚠️ High volatility - Possible manipulation")
+        risk_score += 12
+    
+    # 3. UNUSUAL INTRADAY RANGE (High-Low spread)
+    recent_ranges = []
+    for i in range(-10, 0):
+        if i >= -len(highs):
+            day_range = ((highs[i] - lows[i]) / closes[i]) * 100
+            recent_ranges.append(day_range)
+    
+    avg_range = np.mean(recent_ranges) if recent_ranges else 0
+    
+    if avg_range > 6:
+        warning_flags.append("🚨 Abnormal intraday ranges (>6%) - Manipulation alert")
+        risk_score += 20
+    elif avg_range > 4:
+        warning_flags.append("⚠️ Wide intraday ranges - Increased risk")
+        risk_score += 10
+    
+    # 4. SUSPICIOUS PRICE PATTERN (Sudden spike then consolidation)
+    if len(closes) >= 30:
+        recent_10d = closes[-10:]
+        previous_20d = closes[-30:-10]
+        
+        recent_gain = ((recent_10d[-1] - previous_20d[0]) / previous_20d[0]) * 100
+        previous_stability = np.std(previous_20d) / np.mean(previous_20d)
+        
+        if recent_gain > 20 and previous_stability < 0.05:
+            warning_flags.append("🚨 Sudden spike after flat period - Classic pump pattern")
+            risk_score += 25
+    
+    # 5. VOLUME-PRICE DIVERGENCE (Volume increasing but price not following)
+    if len(volumes) >= 20 and len(closes) >= 20:
+        recent_vol_trend = np.polyfit(range(10), volumes[-10:], 1)[0]
+        recent_price_trend = np.polyfit(range(10), closes[-10:], 1)[0]
+        
+        # Normalize trends
+        vol_trend_pct = (recent_vol_trend / np.mean(volumes[-10:])) * 100
+        price_trend_pct = (recent_price_trend / np.mean(closes[-10:])) * 100
+        
+        if vol_trend_pct > 5 and price_trend_pct < 1:
+            warning_flags.append("⚠️ Volume rising but price flat - Distribution phase?")
+            risk_score += 15
+    
+    # 6. CIRCUIT FILTER HITS (Multiple limit hits)
+    circuit_hits = 0
+    for i in range(-20, 0):
+        if i >= -len(closes):
+            daily_change = abs((closes[i] - closes[i-1]) / closes[i-1]) * 100
+            if daily_change > 9:  # Near 10% circuit (NSE has ~10% limit)
+                circuit_hits += 1
+    
+    if circuit_hits >= 3:
+        warning_flags.append("🚨 Multiple circuit hits - Highly manipulated")
+        risk_score += 30
+    elif circuit_hits >= 2:
+        warning_flags.append("⚠️ Circuit hits detected - High risk")
+        risk_score += 15
+    
+    # 7. LOW LIQUIDITY TRAP (Low consistent volume suddenly spikes)
+    if len(volumes) >= 60:
+        avg_60d_vol = np.mean(volumes[-60:-10])
+        current_vol = volumes[-1]
+        
+        if avg_60d_vol < 100000 and current_vol > avg_60d_vol * 4:
+            warning_flags.append("🚨 Illiquid stock with volume spike - Operator trap")
+            risk_score += 25
+    
+    # 8. PRICE END-OF-DAY MANIPULATION (Closing price very different from average)
+    if len(closes) >= 10:
+        for i in range(-5, 0):
+            if i >= -len(closes) and i >= -len(highs) and i >= -len(lows):
+                day_avg = (highs[i] + lows[i]) / 2
+                close_deviation = abs((closes[i] - day_avg) / day_avg) * 100
+                
+                if close_deviation > 3:
+                    warning_flags.append("⚠️ End-of-day price manipulation detected")
+                    risk_score += 10
+                    break
+    
+    # FINAL VERDICT
+    is_operated = risk_score >= 40  # High confidence of manipulation
+    
+    return is_operated, warning_flags, risk_score
+
 def detect_trend(prices):
     if len(prices) < 5:
         return 'Sideways'
@@ -174,6 +301,9 @@ def analyze_stock(data, criteria_config):
     trend = data['trend']
     closes = data['closes']
     
+    # OPERATOR DETECTION - Critical Safety Check
+    is_operated, operator_flags, operator_risk = detect_operator_activity(data)
+    
     # Calculate additional indicators for early detection
     weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
     monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
@@ -183,6 +313,17 @@ def analyze_stock(data, criteria_config):
     
     score = 0
     criteria = []
+    
+    # CRITICAL: Penalize heavily for operator activity
+    if is_operated:
+        score -= 50  # Heavy penalty
+        criteria.append(f'🚨 OPERATOR DETECTED: Risk Score {operator_risk}/100 - AVOID [-50 pts]')
+    elif operator_risk >= 25:
+        score -= 25
+        criteria.append(f'⚠️ HIGH RISK: Manipulation signs detected (Risk: {operator_risk}/100) [-25 pts]')
+    elif operator_risk >= 15:
+        score -= 10
+        criteria.append(f'⚠️ CAUTION: Some manipulation indicators (Risk: {operator_risk}/100) [-10 pts]')
     
     # 1. CONSOLIDATION/ACCUMULATION PHASE (25 pts) - KEY FOR EARLY ENTRY
     # We want stocks that are NOT rallying yet but showing base building
@@ -322,7 +463,10 @@ def analyze_stock(data, criteria_config):
         criteria.append(f'❌ Upside: Low ({potential_pct:.1f}%) [0 pts]')
     
     # Rating based on EARLY BUY criteria
-    if score >= 100:
+    if is_operated:
+        status = '🚨 OPERATED - AVOID'
+        rating = 'Operated - Avoid'
+    elif score >= 100:
         status = '🚀 PRIME BUY'
         rating = 'Prime Buy'
     elif score >= 90:
@@ -341,7 +485,7 @@ def analyze_stock(data, criteria_config):
         status = '❌ SKIP'
         rating = 'Skip'
     
-    qualified = score >= 80  # Only qualify truly excellent early opportunities
+    qualified = score >= 80 and not is_operated  # Only qualify safe, excellent opportunities
     met_count = len([c for c in criteria if '✅' in c])
     
     return {
@@ -363,7 +507,10 @@ def analyze_stock(data, criteria_config):
         'rating': rating,
         'criteria': criteria,
         'met_count': met_count,
-        'sector': SECTOR_MAP.get(data['symbol'], 'Other')
+        'sector': SECTOR_MAP.get(data['symbol'], 'Other'),
+        'is_operated': is_operated,
+        'operator_risk': operator_risk,
+        'operator_flags': operator_flags
     }
 
 # Main App
@@ -389,7 +536,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 EARLY BUY Criteria")
 st.sidebar.info("""
 *Find stocks BEFORE rally:*
-- Qualified: Score ≥80
+- Qualified: Score ≥80 + Safe
 - Prime Buy: ≥100
 - Excellent: 90-99
 - Strong: 80-89
@@ -403,6 +550,13 @@ st.sidebar.info("""
 - Volume: 1.2-2.0x (accumulation)
 - BB: 10-40% (lower zone)
 - Daily: -2% to +1.5% (not rallying)
+
+*🚨 Operator Detection:*
+- Extreme volume spikes (>5x)
+- High volatility without news
+- Circuit filter hits
+- Price manipulation patterns
+- Operated stocks: -50 pts penalty
 """)
 
 st.sidebar.markdown("---")
@@ -482,53 +636,64 @@ if st.session_state.scan_results:
         'Rating': r['rating'],
         'Status': r['status'],
         'Sector': r['sector'],
+        'Operated': '🚨 YES' if r['is_operated'] else '✅ Safe',
+        'Risk': r['operator_risk'],
         'Met': r['met_count']
     } for r in results])
     
     # Statistics
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     
-    prime = df[df['Score'] >= 100]
-    excellent = df[(df['Score'] >= 90) & (df['Score'] < 100)]
-    strong = df[(df['Score'] >= 80) & (df['Score'] < 90)]
-    good = df[(df['Score'] >= 70) & (df['Score'] < 80)]
-    watchlist = df[(df['Score'] >= 60) & (df['Score'] < 70)]
-    skip = df[df['Score'] < 60]
+    operated_stocks = df[df['Operated'] == '🚨 YES']
+    safe_stocks = df[df['Operated'] == '✅ Safe']
+    prime = df[(df['Score'] >= 100) & (df['Operated'] == '✅ Safe')]
+    excellent = df[(df['Score'] >= 90) & (df['Score'] < 100) & (df['Operated'] == '✅ Safe')]
+    strong = df[(df['Score'] >= 80) & (df['Score'] < 90) & (df['Operated'] == '✅ Safe')]
+    good = df[(df['Score'] >= 70) & (df['Score'] < 80) & (df['Operated'] == '✅ Safe')]
     
-    col1.metric("Total", len(df))
-    col2.metric("🚀 Prime Buy (≥100)", len(prime))
-    col3.metric("🌟 Excellent (90-99)", len(excellent))
-    col4.metric("💎 Strong (80-89)", len(strong))
-    col5.metric("✅ Good (70-79)", len(good))
-    col6.metric("👍 Watch (60-69)", len(watchlist))
+    col1.metric("Total Scanned", len(df))
+    col2.metric("🚨 Operated (AVOID)", len(operated_stocks))
+    col3.metric("✅ Safe Stocks", len(safe_stocks))
+    col4.metric("🚀 Prime Buy", len(prime))
+    col5.metric("🌟 Excellent", len(excellent))
+    col6.metric("💎 Strong", len(strong))
     
     st.markdown("---")
     
     # Filtering
     st.subheader("🔍 Filter Results")
     
-    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(5)
     
     with filter_col1:
         rating_filter = st.selectbox("Rating", 
-            ["All", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip"])
+            ["All", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip", "Operated - Avoid"])
     
     with filter_col2:
+        safety_filter = st.selectbox("Safety", 
+            ["All", "✅ Safe Only", "🚨 Operated Only"])
+    
+    with filter_col3:
         sector_filter = st.selectbox("Sector", 
             ["All"] + sorted(df['Sector'].unique().tolist()))
     
-    with filter_col3:
+    with filter_col4:
         trend_filter = st.selectbox("Trend", 
             ["All", "Strong Uptrend", "Uptrend", "Sideways", "Downtrend"])
     
-    with filter_col4:
-        min_score_filter = st.number_input("Min Score", 0, 140, 0, 5)
+    with filter_col5:
+        min_score_filter = st.number_input("Min Score", -100, 140, 0, 5)
     
     # Apply filters
     filtered_df = df.copy()
     
     if rating_filter != "All":
         filtered_df = filtered_df[filtered_df['Rating'] == rating_filter]
+    
+    if safety_filter == "✅ Safe Only":
+        filtered_df = filtered_df[filtered_df['Operated'] == '✅ Safe']
+    elif safety_filter == "🚨 Operated Only":
+        filtered_df = filtered_df[filtered_df['Operated'] == '🚨 YES']
     
     if sector_filter != "All":
         filtered_df = filtered_df[filtered_df['Sector'] == sector_filter]
@@ -540,11 +705,23 @@ if st.session_state.scan_results:
     
     st.info(f"📊 Showing *{len(filtered_df)}* stocks (filtered from {len(df)} total)")
     
+    # OPERATOR WARNING
+    if len(operated_stocks) > 0:
+        st.error(f"""
+        ⚠️ **OPERATOR ALERT**: Found {len(operated_stocks)} operated/manipulated stocks. 
+        These stocks show high-risk patterns and should be **AVOIDED**.
+        Use the 'Safety' filter above to view them separately.
+        """)
+    
     # Display table with color coding
     st.subheader("📋 Stock Analysis Table")
     
     def highlight_rating(row):
-        if row['Score'] >= 100:
+        # Highlight operated stocks in RED regardless of score
+        if row['Operated'] == '🚨 YES':
+            return ['background-color: #ff6b6b; color: white; font-weight: bold'] * len(row)
+        # Safe stocks with good scores
+        elif row['Score'] >= 100:
             return ['background-color: #c3f7c3; font-weight: bold'] * len(row)  # Bright green
         elif row['Score'] >= 90:
             return ['background-color: #d4edda; font-weight: bold'] * len(row)  # Green
@@ -583,17 +760,37 @@ if st.session_state.scan_results:
         if selected_result:
             st.markdown(f"### {selected_symbol} - {selected_result['status']}")
             
+            # Show operator warning if applicable
+            if selected_result['is_operated']:
+                st.error(f"""
+                🚨 **OPERATOR/MANIPULATION DETECTED** - Risk Score: {selected_result['operator_risk']}/100
+                
+                **DO NOT TRADE THIS STOCK** - High probability of manipulation and dump.
+                """)
+                
+                st.markdown("#### ⚠️ Manipulation Indicators Found:")
+                for flag in selected_result['operator_flags']:
+                    st.warning(flag)
+            elif selected_result['operator_risk'] >= 15:
+                st.warning(f"""
+                ⚠️ **Caution Required** - Operator Risk Score: {selected_result['operator_risk']}/100
+                
+                Some manipulation indicators detected. Trade with extra caution.
+                """)
+            
             col1, col2, col3, col4, col5, col6 = st.columns(6)
             col1.metric("Score", selected_result['score'])
             col2.metric("Price", f"₹{selected_result['price']:.2f}")
             col3.metric("Today", f"{selected_result['change']:+.2f}%")
             col4.metric("Weekly", f"{selected_result['weekly_change']:+.2f}%")
             col5.metric("Potential", f"₹{selected_result['potential_rs']:.2f}")
-            col6.metric("Rating", selected_result['rating'])
+            col6.metric("Risk Score", f"{selected_result['operator_risk']}/100")
             
             st.markdown("#### Detailed Scoring Breakdown")
             for criterion in selected_result['criteria']:
-                if '✅' in criterion:
+                if '🚨' in criterion:
+                    st.error(criterion)
+                elif '✅' in criterion:
                     st.success(criterion)
                 elif '⚠' in criterion:
                     st.warning(criterion)
@@ -630,7 +827,7 @@ else:
     st.info("👈 Configure and click 'FIND EARLY BUYS' to start scanning")
     
     st.markdown("---")
-    st.subheader("🎯 Early Buy Strategy Explained")
+    st.subheader("🎯 Early Buy Strategy + Operator Protection")
     
     col1, col2 = st.columns(2)
     
@@ -650,49 +847,79 @@ else:
         3. ✅ **Do Buy:** RSI 30-50, turning bullish
         4. ✅ **Do Wait:** For setup, not rally
         
-        **1. Consolidation (25 pts)**
-           - Perfect: -3% to +1% weekly
-           - Healthy: -5% to -3% pullback
-           - Avoid: >5% weekly rally
+        **🚨 OPERATOR PROTECTION:**
+        - Detects manipulation patterns
+        - Identifies pump & dump schemes
+        - Flags extreme volatility
+        - Warns about circuit hits
+        - Heavy penalty for operated stocks
         
-        **2. RSI Positioning (20 pts)**
-           - Prime: 30-40 (oversold)
-           - Good: 40-50 (building)
-           - Avoid: >65 (overbought)
+        **8 Operator Detection Signals:**
+        1. **Volume Spikes:** >5x sudden volume
+        2. **Price Volatility:** >8% daily swings
+        3. **Intraday Range:** >6% high-low spread
+        4. **Pump Pattern:** Sudden spike after flat period
+        5. **Volume-Price Divergence:** Volume up, price flat
+        6. **Circuit Hits:** Multiple 10% moves
+        7. **Liquidity Trap:** Low volume stock suddenly spikes
+        8. **End-of-Day Manipulation:** Suspicious closing prices
         """)
     
     with col2:
         st.markdown("""
-        **3. MACD Turning (20 pts)**
-           - Perfect: -2 to +2 (crossover zone)
-           - Early: +2 to +5
+        **Scoring Criteria (140 pts max):**
+        
+        **1. Consolidation (25 pts)**
+           - Perfect: -3% to +1% weekly
+           - Avoid: >5% weekly rally
+        
+        **2. RSI (20 pts)**
+           - Prime: 30-40 (oversold)
+           - Avoid: >65 (overbought)
+        
+        **3. MACD (20 pts)**
+           - Perfect: -2 to +2 (turning)
            - Avoid: >8 (extended)
         
         **4. Bollinger Bands (20 pts)**
            - Prime: 10-25% (lower band)
-           - Good: 25-40% (below middle)
            - Avoid: >70% (upper band)
         
-        **5. Smart Money Volume (15 pts)**
+        **5. Volume (15 pts)**
            - Accumulation: 1.2-2.0x
-           - Building: 2.0-2.5x
            - Avoid: >3x (distribution)
         
         **6. Today's Price (15 pts)**
            - Perfect: -2% to +0.5%
-           - Early: +0.5% to +1.5%
-           - Avoid: >3% (late)
+           - Avoid: >3% (chasing)
         
         **7. Monthly Recovery (15 pts)**
-           - Prime: -10% to -2% (recovery)
-           - Base: -2% to +3%
+           - Prime: -10% to -2%
            - Avoid: >12% (extended)
         
-        **8. Upside Potential (10 pts)**
-           - Target: 8-10%+ move
+        **8. Upside (10 pts)**
+           - Target: 8-10%+
+        
+        **🚨 Operator Penalty:**
+        - Operated: -50 pts
+        - High Risk: -25 pts
+        - Caution: -10 pts
         """)
     
     st.markdown("---")
+    st.error("""
+    **⚠️ CRITICAL SAFETY RULES:**
+    
+    1. **NEVER trade operated stocks** - They show manipulation patterns
+    2. **Check Risk Score** - Avoid stocks with risk score >40
+    3. **Verify manually** - Use additional sources before trading
+    4. **Set stop losses** - Always protect your capital
+    5. **Watch for red flags** - Extreme volume, volatility, circuit hits
+    
+    **Remember:** Operators can create artificial rallies and then dump, leaving retail investors with losses.
+    This scanner helps you identify and AVOID such traps.
+    """)
+    
     st.info("""
     **🎯 BOTTOM LINE:** 
     
@@ -702,8 +929,9 @@ else:
     - **Turning bullish** (MACD crossing)
     - **Near support** (BB lower zone)
     - **Being accumulated** (smart money buying)
+    - **NOT OPERATED** (safe from manipulation)
     
-    **Perfect Entry = BEFORE the 5%+ move, not AFTER**
+    **Perfect Entry = BEFORE the 5%+ move + SAFE from operators**
     """)
 
 st.markdown("---")
