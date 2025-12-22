@@ -1169,7 +1169,7 @@ st.markdown("""
 <p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice. Past performance doesn't guarantee future results.</p>
 </div>
 """, unsafe_allow_html=True)
-        return 'Sideways'
+return 'Sideways'
 
 def analyze_stock(data, criteria_config):
     """Analyze stock to find EARLY BUY opportunities BEFORE rally - ULTRA STRICT MODE"""
