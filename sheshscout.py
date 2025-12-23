@@ -8,392 +8,206 @@ import time
 
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="Pro Stock Scanner - Chart Patterns + IPO Base", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Indian Stock Scout - Ultra-Strict Scanner", page_icon="🎯", layout="wide")
 
-# Enhanced CSS with Dark Mode Support
+# Custom CSS
 st.markdown("""<style>
-.main-header{font-size:2.8rem;font-weight:700;background:linear-gradient(90deg,#00d4ff,#0066ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-align:center;margin-bottom:1rem}
-.sub-header{font-size:1.6rem;font-weight:600;color:#fff;margin:1rem 0}
-.metric-card{background:rgba(255,255,255,0.05);padding:1rem;border-radius:12px;border-left:4px solid #0066ff;margin:0.5rem 0;backdrop-filter:blur(10px)}
-.pattern-badge{display:inline-block;padding:0.3rem 0.8rem;border-radius:20px;font-size:0.85rem;font-weight:600;margin:0.2rem}
-.pattern-bullish{background:#00ff88;color:#000}
-.pattern-bearish{background:#ff4444;color:#fff}
-.pattern-neutral{background:#ffaa00;color:#000}
-
-/* Dark mode table styling */
-div[data-testid="stDataFrame"] {background:rgba(0,0,0,0.3);border-radius:10px;padding:10px}
-div[data-testid="stDataFrame"] table {color:#fff !important}
-div[data-testid="stDataFrame"] th {background:rgba(0,102,255,0.3) !important;color:#fff !important;font-weight:600 !important}
-div[data-testid="stDataFrame"] td {background:rgba(255,255,255,0.05) !important;color:#fff !important;border-color:rgba(255,255,255,0.1) !important}
-div[data-testid="stDataFrame"] tr:hover td {background:rgba(0,102,255,0.2) !important}
-
-/* Enhanced metrics */
-div[data-testid="stMetricValue"] {font-size:1.8rem !important;font-weight:700 !important;color:#00d4ff !important}
-div[data-testid="stMetricLabel"] {font-size:0.95rem !important;color:#aaa !important}
-
-/* Better buttons */
-.stButton>button {border-radius:10px;font-weight:600;border:2px solid #0066ff;background:linear-gradient(135deg,#0066ff,#00d4ff);color:#fff;transition:all 0.3s}
-.stButton>button:hover {transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,102,255,0.4)}
-
-/* Sidebar styling */
-section[data-testid="stSidebar"] {background:rgba(0,0,0,0.5);backdrop-filter:blur(15px)}
-section[data-testid="stSidebar"] * {color:#fff !important}
+.main-header{font-size:2.5rem;font-weight:700;color:#1f77b4;text-align:center;margin-bottom:1rem}
+.sub-header{font-size:1.5rem;font-weight:600;color:#333;margin:1rem 0}
+.metric-card{background:#f8f9fb;padding:0.8rem;border-radius:8px;border-left:4px solid #1f77b4;margin:0.5rem 0}
+.stDataFrame{font-size:0.9rem}
+div[data-testid="stDataFrame"] > div{background:#f8f9fb}
+.price-up{color:#00c853;font-weight:bold}
+.price-down{color:#ff1744;font-weight:bold}
+.price-neutral{color:#666}
 </style>""", unsafe_allow_html=True)
 
-# Comprehensive NSE Stock List (1000+ stocks from provided list)
+# Comprehensive Stock Universe - 200+ NSE Stocks
 NSE_STOCKS = [
-    # From provided list
-    'JSWHL', 'CREATIVE', 'KINGFA', 'NGLFINE', 'HITECHGEAR', 'BOSCHLTD', 'ABBOTINDIA', 'BANARISUG',
-    'ESABINDIA', 'SEJALLTD', 'TASTYBITE', 'TEAMLEASE', 'ASTRAZEN', 'SUNDRMBRAK', 'RPGLIFE', 'SUMMITSEC',
-    'JKCEMENT', 'FINEORG', 'YASHO', 'KICL', 'PILANIINVS', 'ELECTHERM', 'ZENITHEXPO', 'CHEVIOT',
-    'WELINV', 'ACCELYA', 'AUTOAXLES', 'POLYCAB', 'RISHABH', 'ALICON', 'VOLTAMP', 'INNOVACAP',
-    'BELLACASA', 'TVSSRICHAK', 'KIRLOSIND', 'KIRLPNU', 'RML', 'UNIVAFOODS', 'SANDESH', 'ORISSAMINE',
-    'GLOSTERLTD', 'SUNCLAY', 'SABTNL', 'UNICHEMLAB', 'AKZOINDIA', 'HPIL', 'DIXON', 'RANEHOLDIN',
-    'TVSHLTD', 'ORIENTBELL', 'LINCOLN', 'LTIM', 'SEAMECLTD', 'PERSISTENT', 'SALONA', 'ETHOSLTD',
-    'PFIZER', 'PGHH', 'DHANUKA', 'EIMCOELECO', 'GALAXYSURF', 'CRISIL', 'MTARTECH', 'UEL',
-    'MANORG', 'BFUTILITIE', 'POCL', 'WHEELS', 'RATNAMANI', 'GRINDWELL', 'NUVAMA', 'JINDRILL',
-    'SAFARI', 'STEL', 'NUCLEUS', 'XPROINDIA', 'TATVA', 'PIXTRANS', 'MAPMYINDIA', 'INDIGOPNTS',
-    # Nifty 50 + Popular Stocks
-    'RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 'HINDUNILVR', 'ITC', 'SBIN',
+    # Nifty 50
+    'RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 'HINDUNILVR', 'ITC', 'SBIN', 
     'BHARTIARTL', 'KOTAKBANK', 'LT', 'AXISBANK', 'ASIANPAINT', 'MARUTI', 'HCLTECH',
     'BAJFINANCE', 'WIPRO', 'SUNPHARMA', 'TITAN', 'ULTRACEMCO', 'NESTLEIND', 'ONGC',
     'TATAMOTORS', 'NTPC', 'POWERGRID', 'JSWSTEEL', 'M&M', 'TECHM', 'ADANIENT', 'ADANIPORTS',
     'COALINDIA', 'HINDALCO', 'TATASTEEL', 'BAJAJFINSV', 'DIVISLAB', 'DRREDDY', 'GRASIM',
     'CIPLA', 'BRITANNIA', 'EICHERMOT', 'HEROMOTOCO', 'APOLLOHOSP', 'INDUSINDBK', 'UPL',
     'BPCL', 'SBILIFE', 'HDFCLIFE', 'BAJAJ-AUTO', 'VEDL', 'TATACONSUM',
+    # Nifty Next 50 & High Volume Stocks
     'ADANIGREEN', 'GODREJCP', 'DABUR', 'PIDILITIND', 'HAVELLS', 'BERGEPAINT', 'SIEMENS',
-    'AMBUJACEM', 'DLF', 'INDIGO', 'BANDHANBNK', 'CHOLAFIN', 'GAIL', 'TATAPOWER',
-    'MUTHOOTFIN', 'MARICO', 'SAIL', 'AUROPHARMA', 'NMDC', 'LUPIN', 'ZYDUSLIFE',
-    'PETRONET', 'PNB', 'BANKBARODA', 'RECLTD', 'CANBK', 'IRCTC', 'BEL', 'HAL',
-    'HFCL', 'ZEEL', 'INDUSTOWER', 'YESBANK', 'TRENT', 'DMART', 'NAUKRI', 'ZOMATO',
-    'PAYTM', 'PFC', 'MOTHERSON', 'ESCORTS', 'ASHOKLEY', 'TVSMOTOR', 'BALKRISIND', 'MRF',
-    'APOLLOTYRE', 'CEAT', 'JUBLFOOD', 'PAGEIND', 'IGL', 'MGL', 'TORNTPOWER', 'TORNTPHARM',
-    'LICI', 'ABFRL', 'VOLTAS', 'COFORGE', 'MPHASIS', 'OFSS', 'IRFC', 'RVNL', 'TIINDIA',
-    'TATAELXSI', 'LTTS', 'BIOCON', 'ALKEM', 'CUMMINSIND', 'ABB', 'THERMAX',
-    # Additional high-volume stocks
-    'SYNGENE', 'APOLLOPIPE', 'RAILTEL', 'ROUTE', 'MACPOWER', 'CLEAN', 'VARROC', 'KAYNES'
+    'AMBUJACEM', 'DLF', 'INDIGO', 'BANDHANBNK', 'CHOLAFIN', 'GAIL', 'BOSCHLTD',
+    'MUTHOOTFIN', 'MARICO', 'SAIL', 'AUROPHARMA', 'NMDC', 'TATAPOWER', 'LUPIN',
+    'ZYDUSLIFE', 'PETRONET', 'PNB', 'BANKBARODA', 'RECLTD', 'CANBK', 'IRCTC',
+    'BEL', 'HAL', 'HFCL', 'ZEEL', 'INDUSTOWER', 'YESBANK', 'DIXON', 'TRENT',
+    'DMART', 'NAUKRI', 'ZOMATO', 'PAYTM', 'PFC', 'MOTHERSON', 'ESCORTS', 'ASHOKLEY',
+    'TVSMOTOR', 'BALKRISIND', 'MRF', 'APOLLOTYRE', 'CEAT', 'JUBLFOOD',
+    # Additional stocks
+    'PAGEIND', 'IGL', 'MGL', 'TORNTPOWER', 'TORNTPHARM', 'LICI', 'ABFRL', 'VOLTAS', 
+    'PERSISTENT', 'COFORGE', 'LTIM', 'MPHASIS', 'OFSS', 'IRFC', 'RVNL', 'TIINDIA', 
+    'TATAELXSI', 'LTTS', 'BIOCON', 'ALKEM', 'POLYCAB', 'CUMMINSIND', 'ABB', 'THERMAX'
 ]
-
-# Add more stocks from provided list
-ADDITIONAL_STOCKS = [
-    '20MICRONS',
-
-]
-
-NSE_STOCKS.extend(ADDITIONAL_STOCKS)
-NSE_STOCKS = list(set(NSE_STOCKS))  # Remove duplicates
 
 SECTOR_MAP = {
     'RELIANCE': 'Energy', 'TCS': 'IT', 'HDFCBANK': 'Banking', 'INFY': 'IT', 'ICICIBANK': 'Banking',
     'HINDUNILVR': 'FMCG', 'ITC': 'FMCG', 'SBIN': 'Banking', 'BHARTIARTL': 'Telecom', 'KOTAKBANK': 'Banking',
     'LT': 'Infrastructure', 'AXISBANK': 'Banking', 'ASIANPAINT': 'Paints', 'MARUTI': 'Auto', 'HCLTECH': 'IT',
-    'DIXON': 'Electronics', 'POLYCAB': 'Cables', 'PERSISTENT': 'IT', 'COFORGE': 'IT', 'LTIM': 'IT',
-    'ZOMATO': 'Tech', 'PAYTM': 'FinTech', 'NAUKRI': 'Tech', 'IRCTC': 'Travel', 'DMART': 'Retail'
+    'BAJFINANCE': 'NBFC', 'WIPRO': 'IT', 'SUNPHARMA': 'Pharma', 'TITAN': 'Consumer', 'ULTRACEMCO': 'Cement',
+    'NESTLEIND': 'FMCG', 'ONGC': 'Energy', 'TATAMOTORS': 'Auto', 'NTPC': 'Power', 'POWERGRID': 'Power',
+    'JSWSTEEL': 'Metals', 'M&M': 'Auto', 'TECHM': 'IT', 'ADANIENT': 'Conglomerate', 'ADANIPORTS': 'Infrastructure'
 }
 
 @st.cache_data(ttl=300)
 def fetch_stock_data(symbol):
-    """Fetch comprehensive stock data"""
+    """Fetch real-time data from Yahoo Finance with fundamentals"""
     try:
         ticker = yf.Ticker(f"{symbol}.NS")
-        hist = ticker.history(period="1y", interval="1d")
+        hist = ticker.history(period="3mo", interval="1d")
         
-        if hist.empty or len(hist) < 50:
+        if hist.empty:
             return None
         
+        closes = hist['Close'].values
+        highs = hist['High'].values
+        lows = hist['Low'].values
+        volumes = hist['Volume'].values
+        
+        price = closes[-1]
+        prev_close = closes[-2] if len(closes) > 1 else price
+        change = ((price - prev_close) / prev_close) * 100
+        
+        # Get fundamental data
         info = ticker.info
+        market_cap = info.get('marketCap', 0)
+        
+        # Revenue and profit growth
+        revenue_growth = info.get('revenueGrowth', None)
+        profit_margin = info.get('profitMargins', None)
+        earnings_growth = info.get('earningsGrowth', None)
+        
+        # Additional fundamental metrics
+        pe_ratio = info.get('trailingPE', None)
+        roe = info.get('returnOnEquity', None)
+        debt_to_equity = info.get('debtToEquity', None)
+        
+        # Get quarterly financials for growth analysis
+        try:
+            financials = ticker.quarterly_financials
+            if financials is not None and not financials.empty:
+                # Get Total Revenue if available
+                if 'Total Revenue' in financials.index:
+                    revenues = financials.loc['Total Revenue'].values
+                    if len(revenues) >= 4:
+                        # Calculate QoQ and YoY growth
+                        qoq_revenue_growth = ((revenues[0] - revenues[1]) / abs(revenues[1])) * 100 if revenues[1] != 0 else None
+                        yoy_revenue_growth = ((revenues[0] - revenues[3]) / abs(revenues[3])) * 100 if len(revenues) >= 4 and revenues[3] != 0 else None
+                    else:
+                        qoq_revenue_growth = None
+                        yoy_revenue_growth = None
+                else:
+                    qoq_revenue_growth = None
+                    yoy_revenue_growth = None
+                
+                # Get Net Income if available
+                if 'Net Income' in financials.index:
+                    profits = financials.loc['Net Income'].values
+                    if len(profits) >= 4:
+                        qoq_profit_growth = ((profits[0] - profits[1]) / abs(profits[1])) * 100 if profits[1] != 0 else None
+                        yoy_profit_growth = ((profits[0] - profits[3]) / abs(profits[3])) * 100 if len(profits) >= 4 and profits[3] != 0 else None
+                    else:
+                        qoq_profit_growth = None
+                        yoy_profit_growth = None
+                else:
+                    qoq_profit_growth = None
+                    yoy_profit_growth = None
+            else:
+                qoq_revenue_growth = None
+                yoy_revenue_growth = None
+                qoq_profit_growth = None
+                yoy_profit_growth = None
+        except Exception as e:
+            qoq_revenue_growth = None
+            yoy_revenue_growth = None
+            qoq_profit_growth = None
+            yoy_profit_growth = None
+        
+        # Get institutional data
+        fii_dii_activity = detect_institutional_activity(volumes, closes)
+        
+        rsi = calculate_rsi(closes)
+        macd = calculate_macd(closes)
+        bb_position = calculate_bb_position(closes)
+        vol_multiple = calculate_volume_multiple(volumes)
+        trend = detect_trend(closes)
+        
+        # Calculate timeframe changes
+        weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
+        monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
+        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 else 0
         
         return {
             'symbol': symbol,
-            'hist': hist,
-            'closes': hist['Close'].values,
-            'highs': hist['High'].values,
-            'lows': hist['Low'].values,
-            'volumes': hist['Volume'].values,
-            'opens': hist['Open'].values,
-            'info': info,
-            'dates': hist.index
+            'price': price,
+            'change': change,
+            'weekly_change': weekly_change,
+            'monthly_change': monthly_change,
+            'three_month_change': three_month_change,
+            'rsi': rsi,
+            'macd': macd,
+            'bb_position': bb_position,
+            'vol_multiple': vol_multiple,
+            'trend': trend,
+            'closes': closes,
+            'highs': highs,
+            'lows': lows,
+            'volumes': volumes,
+            'fii_dii_score': fii_dii_activity,
+            'market_cap': market_cap,
+            'revenue_growth': revenue_growth,
+            'profit_margin': profit_margin,
+            'earnings_growth': earnings_growth,
+            'pe_ratio': pe_ratio,
+            'roe': roe,
+            'debt_to_equity': debt_to_equity,
+            'qoq_revenue_growth': qoq_revenue_growth,
+            'yoy_revenue_growth': yoy_revenue_growth,
+            'qoq_profit_growth': qoq_profit_growth,
+            'yoy_profit_growth': yoy_profit_growth
         }
     except Exception as e:
         return None
 
-# ============ CHART PATTERN DETECTION ============
+def fetch_live_price(symbol):
+    """Fetch only live price for auto-refresh (non-cached)"""
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        data = ticker.history(period="1d", interval="1m")
+        if not data.empty:
+            return data['Close'].iloc[-1]
+        return None
+    except:
+        return None
 
-def detect_cup_and_handle(closes, highs, lows, lookback=60):
-    """Detect Cup and Handle pattern"""
-    if len(closes) < lookback:
-        return False, 0
+def detect_institutional_activity(volumes, closes):
+    """Detect FII/DII activity patterns from volume and price action"""
+    if len(volumes) < 20 or len(closes) < 20:
+        return 0
     
-    recent = closes[-lookback:]
-    recent_highs = highs[-lookback:]
+    score = 0
+    recent_days = 10
     
-    # Find the cup (U-shaped)
-    max_idx = np.argmax(recent[:lookback//2])
-    min_idx = np.argmax(recent[max_idx:max_idx+lookback//2]) + max_idx
-    
-    cup_depth = (recent[max_idx] - recent[min_idx]) / recent[max_idx]
-    
-    # Cup should be 12-33% deep
-    if 0.12 <= cup_depth <= 0.33:
-        # Check for handle (slight pullback)
-        handle = recent[min_idx:]
-        if len(handle) > 5:
-            handle_high = np.max(handle[:len(handle)//2])
-            handle_low = np.min(handle)
-            handle_depth = (handle_high - handle_low) / handle_high
-            
-            if 0.05 <= handle_depth <= 0.15:
-                confidence = 70 + (cup_depth * 50)
-                return True, min(95, confidence)
-    
-    return False, 0
-
-def detect_double_bottom(closes, lows, lookback=90):
-    """Detect Double Bottom pattern"""
-    if len(closes) < lookback:
-        return False, 0
-    
-    recent_lows = lows[-lookback:]
-    recent_closes = closes[-lookback:]
-    
-    # Find two significant lows
-    sorted_indices = np.argsort(recent_lows)
-    
-    if len(sorted_indices) < 2:
-        return False, 0
-    
-    first_low_idx = sorted_indices[0]
-    second_low_idx = sorted_indices[1]
-    
-    # They should be separated
-    if abs(first_low_idx - second_low_idx) < 10:
-        return False, 0
-    
-    # Lows should be similar (within 3%)
-    low1 = recent_lows[first_low_idx]
-    low2 = recent_lows[second_low_idx]
-    
-    if abs(low1 - low2) / low1 <= 0.03:
-        # Check for neckline breakout
-        peak_between = np.max(recent_closes[min(first_low_idx, second_low_idx):max(first_low_idx, second_low_idx)])
-        current = recent_closes[-1]
+    for i in range(-recent_days, 0):
+        vol_ratio = volumes[i] / np.mean(volumes[-60:]) if len(volumes) >= 60 else volumes[i] / np.mean(volumes)
+        price_change = ((closes[i] - closes[i-1]) / closes[i-1]) * 100 if i > -len(closes) else 0
         
-        if current >= peak_between * 0.98:
-            confidence = 75 + ((current - peak_between) / peak_between * 200)
-            return True, min(95, confidence)
+        if vol_ratio > 1.5 and price_change > 1:
+            score += 2
+        elif vol_ratio > 1.2 and price_change > 0.5:
+            score += 1
+        elif vol_ratio > 1.5 and price_change < -1:
+            score -= 2
+        elif vol_ratio > 1.2 and price_change < -0.5:
+            score -= 1
     
-    return False, 0
-
-def detect_ascending_triangle(highs, lows, lookback=60):
-    """Detect Ascending Triangle"""
-    if len(highs) < lookback:
-        return False, 0
-    
-    recent_highs = highs[-lookback:]
-    recent_lows = lows[-lookback:]
-    
-    # Flat resistance (highs should be similar)
-    high_std = np.std(recent_highs[-20:])
-    high_mean = np.mean(recent_highs[-20:])
-    
-    if high_std / high_mean < 0.02:  # Flat top
-        # Rising support (lows trending up)
-        first_half_lows = np.mean(recent_lows[:lookback//2])
-        second_half_lows = np.mean(recent_lows[lookback//2:])
-        
-        if second_half_lows > first_half_lows * 1.05:
-            confidence = 70 + ((second_half_lows - first_half_lows) / first_half_lows * 100)
-            return True, min(90, confidence)
-    
-    return False, 0
-
-def detect_breakout(closes, highs, lookback=52):
-    """Detect 52-week breakout"""
-    if len(closes) < lookback:
-        return False, 0
-    
-    current = closes[-1]
-    year_high = np.max(highs[-lookback:-5])  # Exclude last 5 days
-    
-    if current >= year_high * 0.995:  # Within 0.5% of 52-week high
-        confidence = 80 + ((current - year_high) / year_high * 200)
-        return True, min(95, confidence)
-    
-    return False, 0
-
-def detect_ipo_base(closes, dates, lookback_days=90):
-    """Detect IPO Base pattern"""
-    if len(closes) < 30:
-        return False, 0, None
-    
-    # Check if stock is relatively new (within 2 years)
-    days_since_first = (dates[-1] - dates[0]).days
-    
-    if days_since_first > 730:  # More than 2 years
-        return False, 0, None
-    
-    # IPO base characteristics:
-    # 1. Consolidation after listing
-    # 2. Low volatility
-    # 3. Tight price action
-    
-    recent = closes[-min(lookback_days, len(closes)):]
-    
-    # Calculate consolidation metrics
-    high = np.max(recent)
-    low = np.min(recent)
-    range_pct = (high - low) / low * 100
-    
-    # Tight consolidation (15-25% range)
-    if 15 <= range_pct <= 25:
-        # Check for low volatility
-        volatility = np.std(recent) / np.mean(recent)
-        
-        if volatility < 0.15:  # Low volatility
-            # Check if near highs
-            current = closes[-1]
-            if current >= high * 0.95:
-                confidence = 75 + (25 * (1 - volatility / 0.15))
-                ipo_age_days = days_since_first
-                return True, min(95, confidence), ipo_age_days
-    
-    return False, 0, None
-
-def detect_vcp(closes, highs, lows, volumes, lookback=90):
-    """Detect Volatility Contraction Pattern (Mark Minervini's VCP)"""
-    if len(closes) < lookback:
-        return False, 0
-    
-    recent_closes = closes[-lookback:]
-    recent_highs = highs[-lookback:]
-    recent_lows = lows[-lookback:]
-    
-    # Divide into 3-4 contractions
-    segment_size = lookback // 4
-    contractions = []
-    
-    for i in range(4):
-        start = i * segment_size
-        end = (i + 1) * segment_size
-        segment = recent_closes[start:end]
-        
-        if len(segment) > 0:
-            seg_high = np.max(segment)
-            seg_low = np.min(segment)
-            contraction = (seg_high - seg_low) / seg_high * 100
-            contractions.append(contraction)
-    
-    # Check if contractions are getting tighter
-    if len(contractions) >= 3:
-        if contractions[-1] < contractions[-2] < contractions[-3]:
-            # Contracting volatility
-            avg_contraction = np.mean(contractions)
-            if avg_contraction < 15:  # Tight pattern
-                confidence = 70 + (30 * (1 - avg_contraction / 15))
-                return True, min(90, confidence)
-    
-    return False, 0
-
-def detect_flat_base(closes, lookback=30):
-    """Detect Flat Base (3-5 weeks of tight consolidation)"""
-    if len(closes) < lookback:
-        return False, 0
-    
-    recent = closes[-lookback:]
-    
-    # Calculate range
-    high = np.max(recent)
-    low = np.min(recent)
-    range_pct = (high - low) / high * 100
-    
-    # Flat base: 10-15% range
-    if 8 <= range_pct <= 15:
-        # Check if near highs
-        current = closes[-1]
-        if current >= high * 0.95:
-            confidence = 75 + (range_pct / 15 * 20)
-            return True, min(90, confidence)
-    
-    return False, 0
-
-def detect_high_tight_flag(closes, lookback=60):
-    """Detect High Tight Flag (strong uptrend + tight consolidation)"""
-    if len(closes) < lookback:
-        return False, 0
-    
-    # Strong uptrend (>100% gain in 4-8 weeks)
-    older = closes[-lookback:-40] if len(closes) > 60 else closes[:-40]
-    recent = closes[-40:]
-    
-    if len(older) > 0:
-        gain = (recent[0] - np.mean(older)) / np.mean(older) * 100
-        
-        if gain >= 80:  # Strong prior move
-            # Tight consolidation (3-5 weeks)
-            consolidation = recent[-20:]
-            con_high = np.max(consolidation)
-            con_low = np.min(consolidation)
-            con_range = (con_high - con_low) / con_high * 100
-            
-            if con_range < 20:  # Tight flag
-                confidence = 80 + (gain / 100 * 15)
-                return True, min(95, confidence)
-    
-    return False, 0
-
-def detect_all_patterns(data):
-    """Detect all chart patterns"""
-    patterns = []
-    
-    closes = data['closes']
-    highs = data['highs']
-    lows = data['lows']
-    volumes = data['volumes']
-    dates = data['dates']
-    
-    # Cup and Handle
-    is_cup, conf = detect_cup_and_handle(closes, highs, lows)
-    if is_cup:
-        patterns.append({'name': '☕ Cup & Handle', 'confidence': conf, 'type': 'bullish'})
-    
-    # Double Bottom
-    is_db, conf = detect_double_bottom(closes, lows)
-    if is_db:
-        patterns.append({'name': '⬇️⬇️ Double Bottom', 'confidence': conf, 'type': 'bullish'})
-    
-    # Ascending Triangle
-    is_at, conf = detect_ascending_triangle(highs, lows)
-    if is_at:
-        patterns.append({'name': '📐 Ascending Triangle', 'confidence': conf, 'type': 'bullish'})
-    
-    # 52-Week Breakout
-    is_bo, conf = detect_breakout(closes, highs)
-    if is_bo:
-        patterns.append({'name': '🚀 52W Breakout', 'confidence': conf, 'type': 'bullish'})
-    
-    # IPO Base
-    is_ipo, conf, age = detect_ipo_base(closes, dates)
-    if is_ipo:
-        patterns.append({'name': f'🆕 IPO Base ({age}d)', 'confidence': conf, 'type': 'bullish'})
-    
-    # VCP
-    is_vcp, conf = detect_vcp(closes, highs, lows, volumes)
-    if is_vcp:
-        patterns.append({'name': '📉 VCP', 'confidence': conf, 'type': 'bullish'})
-    
-    # Flat Base
-    is_fb, conf = detect_flat_base(closes)
-    if is_fb:
-        patterns.append({'name': '➡️ Flat Base', 'confidence': conf, 'type': 'bullish'})
-    
-    # High Tight Flag
-    is_htf, conf = detect_high_tight_flag(closes)
-    if is_htf:
-        patterns.append({'name': '🚩 High Tight Flag', 'confidence': conf, 'type': 'bullish'})
-    
-    return patterns
-
-# ============ TECHNICAL INDICATORS ============
+    return score
 
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -406,7 +220,8 @@ def calculate_rsi(prices, period=14):
     if avg_loss == 0:
         return 100
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 def calculate_macd(prices):
     if len(prices) < 26:
@@ -433,14 +248,78 @@ def calculate_bb_position(prices, period=20):
     current = prices[-1]
     if upper == lower:
         return 50
-    return max(0, min(100, ((current - lower) / (upper - lower)) * 100))
+    position = ((current - lower) / (upper - lower)) * 100
+    return max(0, min(100, position))
 
 def calculate_volume_multiple(volumes):
     if len(volumes) < 20:
         return 1.0
     current = volumes[-1]
     avg20 = np.mean(volumes[-20:])
-    return current / avg20 if avg20 > 0 else 1.0
+    if avg20 == 0:
+        return 1.0
+    return current / avg20
+
+def detect_operator_activity(data):
+    """Detect if stock shows signs of operator/manipulator activity"""
+    closes = data['closes']
+    volumes = data['volumes']
+    highs = data['highs']
+    lows = data['lows']
+    
+    warning_flags = []
+    risk_score = 0
+    
+    if len(closes) < 20:
+        return False, [], 0
+    
+    # 1. EXTREME VOLUME SPIKES
+    recent_vols = volumes[-10:]
+    avg_vol = np.mean(volumes[-60:]) if len(volumes) >= 60 else np.mean(volumes)
+    max_recent_vol = np.max(recent_vols)
+    
+    if max_recent_vol > avg_vol * 5:
+        warning_flags.append("🚨 EXTREME volume spike (>5x avg) - Possible pump")
+        risk_score += 30
+    elif max_recent_vol > avg_vol * 3:
+        warning_flags.append("⚠️ High volume spike (>3x avg) - Monitor closely")
+        risk_score += 15
+    
+    # 2. PRICE VOLATILITY
+    recent_prices = closes[-10:]
+    price_swings = []
+    for i in range(1, len(recent_prices)):
+        swing = abs((recent_prices[i] - recent_prices[i-1]) / recent_prices[i-1]) * 100
+        price_swings.append(swing)
+    
+    avg_swing = np.mean(price_swings) if price_swings else 0
+    max_swing = np.max(price_swings) if price_swings else 0
+    
+    if max_swing > 8 and avg_swing > 3:
+        warning_flags.append("🚨 Extreme volatility (>8% swings) - Operator activity likely")
+        risk_score += 25
+    elif max_swing > 5 and avg_swing > 2:
+        warning_flags.append("⚠️ High volatility - Possible manipulation")
+        risk_score += 12
+    
+    # 3. CIRCUIT FILTER HITS
+    circuit_hits = 0
+    for i in range(-20, 0):
+        if i >= -len(closes):
+            daily_change = abs((closes[i] - closes[i-1]) / closes[i-1]) * 100
+            if daily_change > 9:
+                circuit_hits += 1
+    
+    if circuit_hits >= 3:
+        warning_flags.append("🚨 Multiple circuit hits - Highly manipulated")
+        risk_score += 30
+    elif circuit_hits >= 2:
+        warning_flags.append("⚠️ Circuit hits detected - High risk")
+        risk_score += 15
+    
+    is_operated = risk_score >= 40
+    
+    return is_operated, warning_flags, risk_score
 
 def detect_trend(prices):
     if len(prices) < 5:
@@ -453,146 +332,385 @@ def detect_trend(prices):
         return 'Uptrend'
     elif ups <= 1:
         return 'Downtrend'
-    return 'Sideways'
+    else:
+        return 'Sideways'
 
-def calculate_relative_strength(closes, lookback=20):
-    """Calculate price strength vs moving average"""
-    if len(closes) < lookback:
-        return 0
-    ma = np.mean(closes[-lookback:])
-    current = closes[-1]
-    return ((current - ma) / ma) * 100
-
-# ============ MAIN ANALYSIS FUNCTION ============
-
-def analyze_stock(data):
-    """Comprehensive stock analysis with patterns"""
+def analyze_stock(data, min_market_cap):
+    """Analyze stock with ULTRA-STRICT fundamentals criteria"""
     if not data:
         return None
     
+    price = data['price']
+    change = data['change']
+    rsi = data['rsi']
+    macd = data['macd']
+    bb = data['bb_position']
+    vol = data['vol_multiple']
+    trend = data['trend']
     closes = data['closes']
-    highs = data['highs']
-    lows = data['lows']
-    volumes = data['volumes']
     
-    price = closes[-1]
-    prev_close = closes[-2] if len(closes) > 1 else price
-    change = ((price - prev_close) / prev_close) * 100
+    # Market cap filter (in crores)
+    market_cap = data['market_cap'] / 10000000 if data['market_cap'] else 0
     
-    # Technical indicators
-    rsi = calculate_rsi(closes)
-    macd = calculate_macd(closes)
-    bb = calculate_bb_position(closes)
-    vol = calculate_volume_multiple(volumes)
-    trend = detect_trend(closes)
-    rel_strength = calculate_relative_strength(closes)
+    # Skip if below minimum market cap
+    if market_cap < min_market_cap:
+        return None
     
-    # Detect patterns
-    patterns = detect_all_patterns(data)
+    # OPERATOR DETECTION
+    is_operated, operator_flags, operator_risk = detect_operator_activity(data)
     
-    # Scoring
+    # Calculate additional indicators
+    weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
+    monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
+    three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 else 0
+    
+    potential_rs = max(20, price * 0.10)
+    potential_pct = (potential_rs / price) * 100
+    
     score = 0
     criteria = []
     
-    # 1. Chart Patterns (35 pts) - MOST IMPORTANT
-    if len(patterns) > 0:
-        pattern_score = min(35, len(patterns) * 12)
-        score += pattern_score
-        pattern_names = ", ".join([p['name'] for p in patterns[:3]])
-        criteria.append(f'✅ Patterns: {pattern_names} [{pattern_score} pts]')
-    else:
-        criteria.append(f'❌ Patterns: None [0 pts]')
+    # CRITICAL: Operator penalty
+    if is_operated:
+        score -= 70
+        criteria.append(f'🚨 OPERATOR DETECTED: Risk Score {operator_risk}/100 - AVOID [-70 pts]')
+    elif operator_risk >= 30:
+        score -= 40
+        criteria.append(f'🚨 VERY HIGH RISK: Major manipulation signs (Risk: {operator_risk}/100) [-40 pts]')
+    elif operator_risk >= 20:
+        score -= 25
+        criteria.append(f'⚠️ HIGH RISK: Manipulation signs detected (Risk: {operator_risk}/100) [-25 pts]')
+    elif operator_risk >= 12:
+        score -= 12
+        criteria.append(f'⚠️ CAUTION: Some manipulation indicators (Risk: {operator_risk}/100) [-12 pts]')
     
-    # 2. RSI (15 pts)
-    if 58 <= rsi <= 65:
+    # 1. MARKET CAP QUALITY (15 pts) - NEW!
+    if market_cap >= 50000:
         score += 15
-        criteria.append(f'✅ RSI: Perfect ({rsi:.0f}) [15 pts]')
-    elif 52 <= rsi <= 68:
+        criteria.append(f'✅ Market Cap: Large Cap (₹{market_cap:.0f} Cr) [15 pts]')
+    elif market_cap >= 20000:
         score += 12
-        criteria.append(f'✅ RSI: Strong ({rsi:.0f}) [12 pts]')
-    elif 35 <= rsi <= 42:
-        score += 13
-        criteria.append(f'✅ RSI: Oversold bounce ({rsi:.0f}) [13 pts]')
-    else:
-        criteria.append(f'❌ RSI: {rsi:.0f} [0 pts]')
-    
-    # 3. MACD (15 pts)
-    if macd > 10:
-        score += 15
-        criteria.append(f'✅ MACD: Very Strong ({macd:.1f}) [15 pts]')
-    elif macd > 5:
-        score += 12
-        criteria.append(f'✅ MACD: Strong ({macd:.1f}) [12 pts]')
-    elif macd > 0:
-        score += 8
-        criteria.append(f'⚠ MACD: Bullish ({macd:.1f}) [8 pts]')
-    else:
-        criteria.append(f'❌ MACD: Bearish ({macd:.1f}) [0 pts]')
-    
-    # 4. Volume (15 pts)
-    if vol >= 3.0:
-        score += 15
-        criteria.append(f'✅ Volume: Massive ({vol:.1f}x) [15 pts]')
-    elif vol >= 2.0:
-        score += 12
-        criteria.append(f'✅ Volume: High ({vol:.1f}x) [12 pts]')
-    elif vol >= 1.5:
-        score += 8
-        criteria.append(f'⚠ Volume: Above Avg ({vol:.1f}x) [8 pts]')
-    else:
-        criteria.append(f'❌ Volume: Low ({vol:.1f}x) [0 pts]')
-    
-    # 5. Trend (10 pts)
-    if trend == 'Strong Uptrend':
+        criteria.append(f'✅ Market Cap: Mid-Large Cap (₹{market_cap:.0f} Cr) [12 pts]')
+    elif market_cap >= 10000:
         score += 10
-        criteria.append(f'✅ Trend: Strong Uptrend [10 pts]')
-    elif trend == 'Uptrend':
+        criteria.append(f'✅ Market Cap: Mid Cap (₹{market_cap:.0f} Cr) [10 pts]')
+    elif market_cap >= 5000:
         score += 7
-        criteria.append(f'✅ Trend: Uptrend [7 pts]')
+        criteria.append(f'⚠ Market Cap: Small-Mid Cap (₹{market_cap:.0f} Cr) [7 pts]')
     else:
-        criteria.append(f'❌ Trend: {trend} [0 pts]')
+        score += 0
+        criteria.append(f'❌ Market Cap: Small Cap (₹{market_cap:.0f} Cr) [0 pts]')
     
-    # 6. Daily Change (10 pts)
-    if change >= 5:
+    # 2. REVENUE GROWTH (25 pts) - NEW! STRICTEST CRITERIA
+    yoy_rev = data['yoy_revenue_growth']
+    qoq_rev = data['qoq_revenue_growth']
+    
+    if yoy_rev is not None and qoq_rev is not None:
+        if yoy_rev >= 25 and qoq_rev >= 15:
+            score += 25
+            criteria.append(f'✅ Revenue: EXCEPTIONAL Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [25 pts]')
+        elif yoy_rev >= 20 and qoq_rev >= 10:
+            score += 22
+            criteria.append(f'✅ Revenue: Excellent Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [22 pts]')
+        elif yoy_rev >= 15 and qoq_rev >= 8:
+            score += 18
+            criteria.append(f'✅ Revenue: Strong Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [18 pts]')
+        elif yoy_rev >= 10 and qoq_rev >= 5:
+            score += 12
+            criteria.append(f'⚠ Revenue: Good Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [12 pts]')
+        elif yoy_rev >= 5:
+            score += 5
+            criteria.append(f'⚠ Revenue: Moderate Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [5 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Revenue: Weak/Negative Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [0 pts]')
+    elif yoy_rev is not None:
+        if yoy_rev >= 20:
+            score += 20
+            criteria.append(f'✅ Revenue: Strong YoY Growth ({yoy_rev:.1f}%) [20 pts]')
+        elif yoy_rev >= 12:
+            score += 15
+            criteria.append(f'✅ Revenue: Good YoY Growth ({yoy_rev:.1f}%) [15 pts]')
+        elif yoy_rev >= 5:
+            score += 8
+            criteria.append(f'⚠ Revenue: Moderate Growth ({yoy_rev:.1f}%) [8 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Revenue: Weak Growth ({yoy_rev:.1f}%) [0 pts]')
+    else:
+        score += 0
+        criteria.append(f'❌ Revenue: Data not available [0 pts]')
+    
+    # 3. PROFIT GROWTH (25 pts) - NEW! STRICTEST CRITERIA
+    yoy_profit = data['yoy_profit_growth']
+    qoq_profit = data['qoq_profit_growth']
+    profit_margin = data['profit_margin']
+    
+    if yoy_profit is not None and qoq_profit is not None:
+        if yoy_profit >= 30 and qoq_profit >= 20:
+            score += 25
+            criteria.append(f'✅ Profit: EXCEPTIONAL Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [25 pts]')
+        elif yoy_profit >= 25 and qoq_profit >= 15:
+            score += 22
+            criteria.append(f'✅ Profit: Excellent Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [22 pts]')
+        elif yoy_profit >= 20 and qoq_profit >= 10:
+            score += 18
+            criteria.append(f'✅ Profit: Strong Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [18 pts]')
+        elif yoy_profit >= 12 and qoq_profit >= 6:
+            score += 12
+            criteria.append(f'⚠ Profit: Good Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [12 pts]')
+        elif yoy_profit >= 5:
+            score += 5
+            criteria.append(f'⚠ Profit: Moderate Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [5 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Profit: Weak/Negative Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [0 pts]')
+    elif yoy_profit is not None:
+        if yoy_profit >= 25:
+            score += 20
+            criteria.append(f'✅ Profit: Strong YoY Growth ({yoy_profit:.1f}%) [20 pts]')
+        elif yoy_profit >= 15:
+            score += 15
+            criteria.append(f'✅ Profit: Good YoY Growth ({yoy_profit:.1f}%) [15 pts]')
+        elif yoy_profit >= 8:
+            score += 8
+            criteria.append(f'⚠ Profit: Moderate Growth ({yoy_profit:.1f}%) [8 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Profit: Weak Growth ({yoy_profit:.1f}%) [0 pts]')
+    else:
+        score += 0
+        criteria.append(f'❌ Profit: Data not available [0 pts]')
+    
+    # 4. PROFIT MARGIN (15 pts) - NEW!
+    if profit_margin is not None:
+        profit_margin_pct = profit_margin * 100
+        if profit_margin_pct >= 20:
+            score += 15
+            criteria.append(f'✅ Profit Margin: Excellent ({profit_margin_pct:.1f}%) [15 pts]')
+        elif profit_margin_pct >= 15:
+            score += 12
+            criteria.append(f'✅ Profit Margin: Very Good ({profit_margin_pct:.1f}%) [12 pts]')
+        elif profit_margin_pct >= 10:
+            score += 10
+            criteria.append(f'✅ Profit Margin: Good ({profit_margin_pct:.1f}%) [10 pts]')
+        elif profit_margin_pct >= 5:
+            score += 5
+            criteria.append(f'⚠ Profit Margin: Average ({profit_margin_pct:.1f}%) [5 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Profit Margin: Low ({profit_margin_pct:.1f}%) [0 pts]')
+    else:
+        score += 0
+        criteria.append(f'❌ Profit Margin: Data not available [0 pts]')
+    
+    # 5. FII/DII ACTIVITY (20 pts)
+    fii_score = data['fii_dii_score']
+    if fii_score >= 15:
+        score += 20
+        criteria.append(f'✅ FII/DII: Strong Buying ({fii_score}) [20 pts]')
+    elif fii_score >= 10:
+        score += 15
+        criteria.append(f'✅ FII/DII: Good Buying ({fii_score}) [15 pts]')
+    elif fii_score >= 5:
         score += 10
-        criteria.append(f'✅ Daily: Exceptional ({change:+.1f}%) [10 pts]')
-    elif change >= 3:
-        score += 8
-        criteria.append(f'✅ Daily: Strong ({change:+.1f}%) [8 pts]')
-    elif change >= 2:
+        criteria.append(f'✅ FII/DII: Accumulation ({fii_score}) [10 pts]')
+    elif fii_score >= 0:
         score += 5
-        criteria.append(f'⚠ Daily: Good ({change:+.1f}%) [5 pts]')
+        criteria.append(f'⚠ FII/DII: Neutral ({fii_score}) [5 pts]')
     else:
-        criteria.append(f'❌ Daily: {change:+.1f}% [0 pts]')
+        score += 0
+        criteria.append(f'❌ FII/DII: Selling ({fii_score}) [0 pts]')
     
-    # Rating
-    if score >= 85:
-        status = '🌟 EXCELLENT'
-        rating = 'Excellent'
-    elif score >= 75:
-        status = '💎 VERY GOOD'
-        rating = 'Very Good'
-    elif score >= 65:
-        status = '✅ GOOD'
-        rating = 'Good'
-    elif score >= 55:
-        status = '👍 FAIR'
-        rating = 'Fair'
+    # 6. CONSOLIDATION (20 pts)
+    if -2 <= weekly_change <= 0.3:
+        score += 20
+        criteria.append(f'✅ Consolidation: Perfect base ({weekly_change:+.1f}% weekly) [20 pts]')
+    elif -3.5 <= weekly_change < -2:
+        score += 18
+        criteria.append(f'✅ Consolidation: Healthy pullback ({weekly_change:+.1f}% weekly) [18 pts]')
+    elif 0.3 < weekly_change <= 1.5:
+        score += 15
+        criteria.append(f'✅ Consolidation: Early breakout ({weekly_change:+.1f}% weekly) [15 pts]')
+    elif weekly_change > 4:
+        score += 0
+        criteria.append(f'❌ Already rallied ({weekly_change:+.1f}% weekly) [0 pts]')
     else:
-        status = '⚠ WATCHLIST'
+        score += 5
+        criteria.append(f'⚠ Consolidation: Weak ({weekly_change:+.1f}% weekly) [5 pts]')
+    
+    # 7. RSI (20 pts)
+    if 32 <= rsi <= 38:
+        score += 20
+        criteria.append(f'✅ RSI: Perfect oversold entry ({rsi:.0f}) [20 pts]')
+    elif 38 < rsi <= 45:
+        score += 17
+        criteria.append(f'✅ RSI: Building momentum ({rsi:.0f}) [17 pts]')
+    elif 45 < rsi <= 50:
+        score += 12
+        criteria.append(f'✅ RSI: Early momentum ({rsi:.0f}) [12 pts]')
+    elif 50 < rsi <= 55:
+        score += 8
+        criteria.append(f'⚠ RSI: Neutral ({rsi:.0f}) [8 pts]')
+    elif rsi > 62:
+        score += 0
+        criteria.append(f'❌ RSI: Overbought ({rsi:.0f}) [0 pts]')
+    else:
+        score += 5
+        criteria.append(f'⚠ RSI: Moderate ({rsi:.0f}) [5 pts]')
+    
+    # 8. MACD (15 pts)
+    if -1 <= macd <= 1:
+        score += 15
+        criteria.append(f'✅ MACD: Perfect crossover ({macd:.1f}) [15 pts]')
+    elif 1 < macd <= 3:
+        score += 12
+        criteria.append(f'✅ MACD: Early bullish ({macd:.1f}) [12 pts]')
+    elif -3 <= macd < -1:
+        score += 10
+        criteria.append(f'✅ MACD: About to turn ({macd:.1f}) [10 pts]')
+    elif macd > 6:
+        score += 0
+        criteria.append(f'❌ MACD: Extended ({macd:.1f}) [0 pts]')
+    else:
+        score += 5
+        criteria.append(f'⚠ MACD: Weak ({macd:.1f}) [5 pts]')
+    
+    # 9. BOLLINGER BANDS (15 pts)
+    if 8 <= bb <= 20:
+        score += 15
+        criteria.append(f'✅ BB: Lower band bounce ({bb:.0f}%) [15 pts]')
+    elif 20 < bb <= 30:
+        score += 12
+        criteria.append(f'✅ BB: Below middle ({bb:.0f}%) [12 pts]')
+    elif 30 < bb <= 45:
+        score += 8
+        criteria.append(f'⚠ BB: Middle zone ({bb:.0f}%) [8 pts]')
+    elif bb > 65:
+        score += 0
+        criteria.append(f'❌ BB: Upper band ({bb:.0f}%) [0 pts]')
+    else:
+        score += 5
+        criteria.append(f'⚠ BB: Neutral ({bb:.0f}%) [5 pts]')
+    
+    # 10. VOLUME (15 pts)
+    if 1.3 <= vol <= 1.8:
+        score += 15
+        criteria.append(f'✅ Volume: Perfect accumulation ({vol:.1f}x) [15 pts]')
+    elif 1.8 < vol <= 2.2:
+        score += 12
+        criteria.append(f'✅ Volume: Building interest ({vol:.1f}x) [12 pts]')
+    elif vol > 2.8:
+        score += 5
+        criteria.append(f'⚠ Volume: Too high ({vol:.1f}x) [5 pts]')
+    elif 1.0 <= vol < 1.3:
+        score += 7
+        criteria.append(f'⚠ Volume: Average ({vol:.1f}x) [7 pts]')
+    else:
+        score += 0
+        criteria.append(f'❌ Volume: Too low ({vol:.1f}x) [0 pts]')
+    
+    # 11. TODAY'S PRICE (10 pts)
+    if -1.5 <= change <= 0.3:
+        score += 10
+        criteria.append(f'✅ Today: Perfect entry ({change:+.1f}%) [10 pts]')
+    elif 0.3 < change <= 1.2:
+        score += 8
+        criteria.append(f'✅ Today: Early move ({change:+.1f}%) [8 pts]')
+    elif -2.5 <= change < -1.5:
+        score += 7
+        criteria.append(f'⚠ Today: Dip ({change:+.1f}%) [7 pts]')
+    elif change > 2.5:
+        score += 0
+        criteria.append(f'❌ Today: Already rallied ({change:+.1f}%) [0 pts]')
+    else:
+        score += 4
+        criteria.append(f'⚠ Today: Moderate ({change:+.1f}%) [4 pts]')
+    
+    # 12. MONTHLY TREND (10 pts)
+    if -8 <= monthly_change <= -2:
+        score += 10
+        criteria.append(f'✅ Monthly: Recovering from dip ({monthly_change:+.1f}%) [10 pts]')
+    elif -2 < monthly_change <= 2:
+        score += 8
+        criteria.append(f'✅ Monthly: Base building ({monthly_change:+.1f}%) [8 pts]')
+    elif 2 < monthly_change <= 6:
+        score += 5
+        criteria.append(f'⚠ Monthly: Moderate gain ({monthly_change:+.1f}%) [5 pts]')
+    elif monthly_change > 10:
+        score += 0
+        criteria.append(f'❌ Monthly: Extended ({monthly_change:+.1f}%) [0 pts]')
+    else:
+        score += 3
+        criteria.append(f'⚠ Monthly: Weak ({monthly_change:+.1f}%) [3 pts]')
+    
+    # 13. 3-MONTH PERFORMANCE (10 pts)
+    if -15 <= three_month_change <= -5:
+        score += 10
+        criteria.append(f'✅ 3-Month: Perfect correction ({three_month_change:+.1f}%) [10 pts]')
+    elif -5 < three_month_change <= 5:
+        score += 8
+        criteria.append(f'✅ 3-Month: Sideways base ({three_month_change:+.1f}%) [8 pts]')
+    elif 5 < three_month_change <= 15:
+        score += 5
+        criteria.append(f'⚠ 3-Month: Moderate rise ({three_month_change:+.1f}%) [5 pts]')
+    elif three_month_change > 25:
+        score += 0
+        criteria.append(f'❌ 3-Month: Overextended ({three_month_change:+.1f}%) [0 pts]')
+    else:
+        score += 3
+        criteria.append(f'⚠ 3-Month: Weak ({three_month_change:+.1f}%) [3 pts]')
+    
+    # 14. UPSIDE POTENTIAL (10 pts)
+    if potential_pct >= 12:
+        score += 10
+        criteria.append(f'✅ Upside: Excellent ({potential_pct:.1f}%) [10 pts]')
+    elif potential_pct >= 10:
+        score += 8
+        criteria.append(f'✅ Upside: Very Good ({potential_pct:.1f}%) [8 pts]')
+    elif potential_pct >= 8:
+        score += 5
+        criteria.append(f'⚠ Upside: Good ({potential_pct:.1f}%) [5 pts]')
+    else:
+        score += 0
+        criteria.append(f'❌ Upside: Low ({potential_pct:.1f}%) [0 pts]')
+    
+    # Rating based on ULTRA-STRICT criteria
+    if is_operated:
+        status = '🚨 OPERATED - AVOID'
+        rating = 'Operated - Avoid'
+    elif score >= 180:
+        status = '🌟 EXCEPTIONAL BUY'
+        rating = 'Exceptional Buy'
+    elif score >= 160:
+        status = '🚀 PRIME BUY'
+        rating = 'Prime Buy'
+    elif score >= 140:
+        status = '💎 EXCELLENT BUY'
+        rating = 'Excellent Buy'
+    elif score >= 120:
+        status = '✅ STRONG BUY'
+        rating = 'Strong Buy'
+    elif score >= 100:
+        status = '👍 GOOD BUY'
+        rating = 'Good Buy'
+    elif score >= 80:
+        status = '📋 WATCHLIST'
         rating = 'Watchlist'
+    else:
+        status = '❌ SKIP'
+        rating = 'Skip'
     
-    qualified = score >= 65
+    qualified = score >= 140 and not is_operated
     met_count = len([c for c in criteria if '✅' in c])
-    
-    # Calculate potential
-    potential_rs = max(20, price * 0.06)
-    potential_pct = (potential_rs / price) * 100
     
     return {
         'symbol': data['symbol'],
         'price': price,
         'change': change,
+        'weekly_change': weekly_change,
+        'monthly_change': monthly_change,
+        'three_month_change': three_month_change,
         'potential_rs': potential_rs,
         'potential_pct': potential_pct,
         'rsi': rsi,
@@ -600,7 +718,6 @@ def analyze_stock(data):
         'bb': bb,
         'vol': vol,
         'trend': trend,
-        'rel_strength': rel_strength,
         'score': score,
         'qualified': qualified,
         'status': status,
@@ -608,70 +725,90 @@ def analyze_stock(data):
         'criteria': criteria,
         'met_count': met_count,
         'sector': SECTOR_MAP.get(data['symbol'], 'Other'),
-        'patterns': patterns,
-        'pattern_count': len(patterns)
+        'is_operated': is_operated,
+        'operator_risk': operator_risk,
+        'operator_flags': operator_flags,
+        'market_cap': market_cap,
+        'yoy_revenue_growth': yoy_rev,
+        'qoq_revenue_growth': qoq_rev,
+        'yoy_profit_growth': yoy_profit,
+        'qoq_profit_growth': qoq_profit,
+        'profit_margin': profit_margin * 100 if profit_margin else None
     }
 
-# ============ STREAMLIT APP ============
-
-st.markdown('<p class="main-header">📊 Pro Stock Scanner - Chart Patterns + IPO Base</p>', unsafe_allow_html=True)
-st.markdown("**Advanced pattern recognition including Cup & Handle, Double Bottom, IPO Base, VCP, and more**")
+# Main App
+st.markdown('<p class="main-header">🎯 Indian Stock Scout - ULTRA-STRICT with Fundamentals</p>', unsafe_allow_html=True)
+st.markdown("*Only stocks with EXCEPTIONAL fundamentals + technicals qualify*")
 
 # Sidebar
-st.sidebar.header("⚙️ Scanner Configuration")
+st.sidebar.header("⚙ Scanner Configuration")
 
-scan_mode = st.sidebar.radio("📊 Scan Mode", 
-    ["Quick Scan (100 stocks)", "Medium Scan (200 stocks)", "Full Scan (500+ stocks)", "Custom List"])
+scan_mode = st.sidebar.radio("Scan Mode", 
+    ["Quick Scan (50 stocks)", "Full Scan (100+ stocks)", "Custom List"])
 
-if scan_mode == "Quick Scan (100 stocks)":
-    stocks_to_scan = NSE_STOCKS[:100]
-elif scan_mode == "Medium Scan (200 stocks)":
-    stocks_to_scan = NSE_STOCKS[:200]
-elif scan_mode == "Full Scan (500+ stocks)":
-    stocks_to_scan = NSE_STOCKS[:500]
+if scan_mode == "Quick Scan (50 stocks)":
+    stocks_to_scan = NSE_STOCKS[:50]
+elif scan_mode == "Full Scan (100+ stocks)":
+    stocks_to_scan = NSE_STOCKS
 else:
     custom_input = st.sidebar.text_area("Enter NSE symbols (one per line)", 
-        "RELIANCE\nTCS\nINFY\nHDFCBANK\nDIXON", height=150)
+        "RELIANCE\nTCS\nINFY\nHDFCBANK\nICICIBANK", height=150)
     stocks_to_scan = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Pattern Filters")
-
-pattern_filter = st.sidebar.multiselect(
-    "Show only stocks with patterns:",
-    ["Cup & Handle", "Double Bottom", "Ascending Triangle", "52W Breakout", 
-     "IPO Base", "VCP", "Flat Base", "High Tight Flag", "Any Pattern"],
-    default=[]
-)
+st.sidebar.subheader("💰 Market Cap Filter")
+min_market_cap = st.sidebar.slider("Minimum Market Cap (₹ Crores)", 
+    0, 100000, 5000, 1000,
+    help="Filter stocks by minimum market capitalization")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📈 Chart Patterns Detected")
+st.sidebar.subheader("🎯 ULTRA-STRICT Criteria")
 st.sidebar.info("""
-**Bullish Patterns:**
-- ☕ **Cup & Handle**: Classic continuation
-- ⬇️⬇️ **Double Bottom**: Reversal pattern
-- 📐 **Ascending Triangle**: Breakout setup
-- 🚀 **52W Breakout**: New highs
-- 🆕 **IPO Base**: Post-listing base
-- 📉 **VCP**: Volatility contraction
-- ➡️ **Flat Base**: Tight consolidation
-- 🚩 **High Tight Flag**: Strong momentum
+*Only top 1-3% qualify!*
 
-**Scoring:**
-- Patterns: 35 pts (most important!)
-- RSI: 15 pts
-- MACD: 15 pts
-- Volume: 15 pts
-- Trend: 10 pts
-- Daily Change: 10 pts
+**TOTAL: 250 Points**
+
+**Fundamentals (80 pts):**
+1. Market Cap (15 pts)
+2. Revenue Growth (25 pts)
+   - YoY ≥20%, QoQ ≥10%
+3. Profit Growth (25 pts)
+   - YoY ≥25%, QoQ ≥15%
+4. Profit Margin (15 pts)
+   - ≥15% excellent
+
+**Technicals (170 pts):**
+5. FII/DII (20 pts)
+6. Consolidation (20 pts)
+7. RSI (20 pts): 32-38
+8. MACD (15 pts): -1 to +1
+9. BB (15 pts): 8-20%
+10. Volume (15 pts): 1.3-1.8x
+11. Today (10 pts)
+12. Monthly (10 pts)
+13. 3-Month (10 pts)
+14. Upside (10 pts): ≥12%
+
+**Qualification:**
+- Exceptional: ≥180 pts
+- Prime: 160-179 pts
+- Excellent: 140-159 pts ✅
+- Strong: 120-139 pts
+- Below 140: Not qualified
+
+**Penalties:**
+- Operated: -70 pts
+- High Risk: -25 to -40 pts
 """)
+
+st.sidebar.markdown("---")
 
 if 'scan_results' not in st.session_state:
     st.session_state.scan_results = None
 
-if st.sidebar.button("🚀 START PATTERN SCAN", type="primary", use_container_width=True):
+if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_container_width=True):
     st.markdown("---")
-    st.subheader("📊 Scanning for Chart Patterns...")
+    st.subheader("📊 Scanning with Fundamental + Technical Analysis...")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -680,34 +817,37 @@ if st.sidebar.button("🚀 START PATTERN SCAN", type="primary", use_container_wi
     results = []
     total = len(stocks_to_scan)
     failed = 0
-    patterns_found = 0
+    filtered_out = 0
     
     for idx, symbol in enumerate(stocks_to_scan):
-        status_text.info(f"📊 Analyzing **{symbol}**... ({idx+1}/{total})")
+        status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
         
         data = fetch_stock_data(symbol)
         if data:
-            analysis = analyze_stock(data)
+            analysis = analyze_stock(data, min_market_cap)
             if analysis:
                 results.append(analysis)
-                if analysis['pattern_count'] > 0:
-                    patterns_found += 1
+            else:
+                filtered_out += 1
         else:
             failed += 1
         
         progress = (idx + 1) / total
         progress_bar.progress(progress)
         
-        if (idx + 1) % 20 == 0 or idx == total - 1:
-            qualified_count = len([r for r in results if r['qualified']])
-            stats_placeholder.info(f"✅ Analyzed: {len(results)} | Qualified: {qualified_count} | Patterns Found: {patterns_found} | Failed: {failed}")
+        if (idx + 1) % 10 == 0 or idx == total - 1:
+            valid_results_count = len([r for r in results if r is not None])
+            qualified_count = len([r for r in results if r is not None and r['qualified']])
+            stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥140): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
         
-        time.sleep(0.1)
+        time.sleep(0.2)
     
+    # Filter out None results before storing
+    results = [r for r in results if r is not None]
     st.session_state.scan_results = results
     st.session_state.scan_timestamp = datetime.now()
     
-    status_text.success(f"✅ Scan complete! Found {patterns_found} stocks with patterns!")
+    status_text.success(f"✅ Scan complete! Found {len(results)} stocks meeting market cap criteria")
     time.sleep(1)
     status_text.empty()
     stats_placeholder.empty()
@@ -715,53 +855,123 @@ if st.sidebar.button("🚀 START PATTERN SCAN", type="primary", use_container_wi
     
     st.rerun()
 
-# Display Results
+# Display results
 if st.session_state.scan_results:
     results = st.session_state.scan_results
     scan_time = st.session_state.scan_timestamp
     
     st.markdown("---")
-    st.subheader(f"📈 Scan Results - Pattern Recognition")
-    st.caption(f"Scanned at: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Auto-refresh toggle
+    col_refresh1, col_refresh2, col_refresh3 = st.columns([2, 2, 6])
+    
+    with col_refresh1:
+        auto_refresh = st.checkbox("🔄 Auto-refresh prices", value=False, 
+                                   help="Continuously update prices every 30 seconds without resetting")
+    
+    with col_refresh2:
+        if 'last_refresh' in st.session_state:
+            seconds_ago = int((datetime.now() - st.session_state.last_refresh).total_seconds())
+            st.caption(f"📡 Updated {seconds_ago}s ago")
+        else:
+            st.caption("📡 Not refreshed yet")
+    
+    with col_refresh3:
+        if auto_refresh:
+            if st.button("⏸️ Pause Refresh"):
+                st.session_state.auto_refresh_paused = True
+                st.rerun()
+    
+    st.subheader(f"📈 Exceptional Stock Opportunities")
+    st.caption(f"Initial scan: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Auto-refresh logic - NON-BLOCKING
+    if auto_refresh and not st.session_state.get('auto_refresh_paused', False):
+        # Initialize refresh counter
+        if 'refresh_counter' not in st.session_state:
+            st.session_state.refresh_counter = 0
+            st.session_state.last_refresh = datetime.now()
+        
+        # Check if 30 seconds have passed
+        time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
+        
+        if time_since_refresh >= 30:
+            # Update prices in background
+            with st.spinner("🔄 Refreshing live prices..."):
+                updated_count = 0
+                for result in results:
+                    new_price = fetch_live_price(result['symbol'])
+                    if new_price and new_price != result['price']:
+                        prev_price = result['price']
+                        result['price'] = new_price
+                        result['change'] = ((new_price - prev_price) / prev_price) * 100
+                        updated_count += 1
+                
+                st.session_state.last_refresh = datetime.now()
+                st.session_state.refresh_counter += 1
+                
+                if updated_count > 0:
+                    st.toast(f"✅ Updated {updated_count} prices", icon="🔄")
+            
+            # Force re-render
+            time.sleep(1)
+            st.rerun()
+        else:
+            # Schedule next refresh
+            remaining = 30 - time_since_refresh
+            st.info(f"⏱️ Next refresh in {int(remaining)} seconds...")
+            time.sleep(5)  # Check every 5 seconds
+            st.rerun()
     
     # Convert to DataFrame
-    df_data = []
-    for r in results:
-        pattern_str = ", ".join([p['name'] for p in r['patterns'][:2]]) if r['patterns'] else "None"
-        
-        df_data.append({
-            'Symbol': r['symbol'],
-            'Price': r['price'],
-            'Change %': r['change'],
-            'Patterns': pattern_str,
-            'Pattern Count': r['pattern_count'],
-            'RSI': r['rsi'],
-            'MACD': 'Bull' if r['macd'] > 0 else 'Bear',
-            'Vol': f"{r['vol']:.1f}x",
-            'Trend': r['trend'],
-            'Score': r['score'],
-            'Rating': r['rating'],
-            'Status': r['status'],
-            'Sector': r['sector']
-        })
-    
-    df = pd.DataFrame(df_data)
+    df = pd.DataFrame([{
+        'Symbol': r['symbol'],
+        'Price (₹)': r['price'],
+        'Today (%)': r['change'],
+        'Weekly (%)': r['weekly_change'],
+        'Monthly (%)': r['monthly_change'],
+        '3M (%)': r['three_month_change'],
+        'Market Cap (₹Cr)': r['market_cap'],
+        'Rev YoY (%)': r['yoy_revenue_growth'],
+        'Rev QoQ (%)': r['qoq_revenue_growth'],
+        'Profit YoY (%)': r['yoy_profit_growth'],
+        'Profit QoQ (%)': r['qoq_profit_growth'],
+        'Margin (%)': r['profit_margin'],
+        'RSI': r['rsi'],
+        'MACD': r['macd'],
+        'BB (%)': r['bb'],
+        'Vol': f"{r['vol']:.1f}x",
+        'Score': r['score'],
+        'Rating': r['rating'],
+        'Status': r['status'],
+        'Sector': r['sector'],
+        'Operated': '🚨 YES' if r['is_operated'] else '✅ Safe',
+        'Risk': r['operator_risk']
+    } for r in results])
     
     # Statistics
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     
-    total_patterns = sum([r['pattern_count'] for r in results])
-    stocks_with_patterns = len([r for r in results if r['pattern_count'] > 0])
-    excellent = len([r for r in results if r['score'] >= 85])
-    very_good = len([r for r in results if 75 <= r['score'] < 85])
-    good = len([r for r in results if 65 <= r['score'] < 75])
+    operated_stocks = df[df['Operated'] == '🚨 YES']
+    safe_stocks = df[df['Operated'] == '✅ Safe']
+    exceptional = df[(df['Score'] >= 180) & (df['Operated'] == '✅ Safe')]
+    prime = df[(df['Score'] >= 160) & (df['Score'] < 180) & (df['Operated'] == '✅ Safe')]
+    excellent = df[(df['Score'] >= 140) & (df['Score'] < 160) & (df['Operated'] == '✅ Safe')]
+    strong = df[(df['Score'] >= 120) & (df['Score'] < 140) & (df['Operated'] == '✅ Safe')]
     
     col1.metric("Total Scanned", len(df))
-    col2.metric("🎯 With Patterns", stocks_with_patterns)
-    col3.metric("📊 Total Patterns", total_patterns)
-    col4.metric("🌟 Excellent", excellent)
-    col5.metric("💎 Very Good", very_good)
-    col6.metric("✅ Good", good)
+    col2.metric("🚨 Operated", len(operated_stocks))
+    col3.metric("🌟 Exceptional (≥180)", len(exceptional))
+    col4.metric("🚀 Prime (160-179)", len(prime))
+    col5.metric("💎 Excellent (140-159)", len(excellent))
+    col6.metric("✅ Strong (120-139)", len(strong))
+    
+    # Qualification summary
+    qualified_total = len(exceptional) + len(prime) + len(excellent)
+    st.success(f"""
+    **🎯 ULTRA-STRICT RESULTS:** Only **{qualified_total}** stocks qualified (Score ≥140 + Safe) out of {len(df)}.
+    That's the top **{(qualified_total/len(df)*100) if len(df) > 0 else 0:.1f}%** - truly exceptional opportunities with strong fundamentals!
+    """)
     
     st.markdown("---")
     
@@ -772,18 +982,19 @@ if st.session_state.scan_results:
     
     with filter_col1:
         rating_filter = st.selectbox("Rating", 
-            ["All", "Excellent", "Very Good", "Good", "Fair", "Watchlist"])
+            ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip"])
     
     with filter_col2:
+        safety_filter = st.selectbox("Safety", 
+            ["All", "✅ Safe Only", "🚨 Operated Only"])
+    
+    with filter_col3:
         sector_filter = st.selectbox("Sector", 
             ["All"] + sorted(df['Sector'].unique().tolist()))
     
-    with filter_col3:
-        pattern_count_filter = st.selectbox("Pattern Count", 
-            ["All", "3+", "2+", "1+", "0"])
-    
     with filter_col4:
-        min_score_filter = st.number_input("Min Score", 0, 100, 0, 5)
+        min_score_filter = st.number_input("Min Score", 0, 250, 140, 10,
+                                          help="Default: 140 (Qualified)")
     
     # Apply filters
     filtered_df = df.copy()
@@ -791,88 +1002,56 @@ if st.session_state.scan_results:
     if rating_filter != "All":
         filtered_df = filtered_df[filtered_df['Rating'] == rating_filter]
     
+    if safety_filter == "✅ Safe Only":
+        filtered_df = filtered_df[filtered_df['Operated'] == '✅ Safe']
+    elif safety_filter == "🚨 Operated Only":
+        filtered_df = filtered_df[filtered_df['Operated'] == '🚨 YES']
+    
     if sector_filter != "All":
         filtered_df = filtered_df[filtered_df['Sector'] == sector_filter]
     
-    if pattern_count_filter == "3+":
-        filtered_df = filtered_df[filtered_df['Pattern Count'] >= 3]
-    elif pattern_count_filter == "2+":
-        filtered_df = filtered_df[filtered_df['Pattern Count'] >= 2]
-    elif pattern_count_filter == "1+":
-        filtered_df = filtered_df[filtered_df['Pattern Count'] >= 1]
-    elif pattern_count_filter == "0":
-        filtered_df = filtered_df[filtered_df['Pattern Count'] == 0]
-    
     filtered_df = filtered_df[filtered_df['Score'] >= min_score_filter]
     
-    # Apply pattern filter
-    if pattern_filter:
-        if "Any Pattern" in pattern_filter:
-            filtered_df = filtered_df[filtered_df['Pattern Count'] > 0]
-        else:
-            # Filter by specific patterns
-            filtered_results = []
-            for r in results:
-                for p in r['patterns']:
-                    for pf in pattern_filter:
-                        if pf in p['name']:
-                            if r['symbol'] in filtered_df['Symbol'].values:
-                                filtered_results.append(r['symbol'])
-                                break
-            if filtered_results:
-                filtered_df = filtered_df[filtered_df['Symbol'].isin(filtered_results)]
-    
-    st.info(f"📊 Showing **{len(filtered_df)}** stocks (filtered from {len(df)} total)")
-    
-    # Sort by score
-    filtered_df = filtered_df.sort_values('Score', ascending=False)
+    st.info(f"📊 Showing *{len(filtered_df)}* stocks (filtered from {len(df)} total)")
     
     # Display table
     st.subheader("📋 Stock Analysis Table")
     
-    # Format and display
-    display_df = filtered_df.copy()
-    display_df['Price'] = display_df['Price'].apply(lambda x: f'₹{x:.2f}')
-    display_df['Change %'] = display_df['Change %'].apply(lambda x: f'{x:+.2f}%')
-    display_df['RSI'] = display_df['RSI'].apply(lambda x: f'{x:.1f}')
+    def highlight_rating(row):
+        if row['Operated'] == '🚨 YES':
+            return ['background-color: #ff6b6b; color: white; font-weight: bold'] * len(row)
+        elif row['Score'] >= 180:
+            return ['background-color: #00e676; color: black; font-weight: bold'] * len(row)
+        elif row['Score'] >= 160:
+            return ['background-color: #69f0ae; font-weight: bold'] * len(row)
+        elif row['Score'] >= 140:
+            return ['background-color: #b9f6ca; font-weight: bold'] * len(row)
+        elif row['Score'] >= 120:
+            return ['background-color: #e1f5fe'] * len(row)
+        elif row['Score'] >= 100:
+            return ['background-color: #fff9c4'] * len(row)
+        else:
+            return ['background-color: #ffebee'] * len(row)
     
-    st.dataframe(display_df, use_container_width=True, height=600)
+    styled_df = filtered_df.style.apply(highlight_rating, axis=1)\
+        .format({
+            'Price (₹)': '₹{:.2f}',
+            'Today (%)': '{:+.2f}%',
+            'Weekly (%)': '{:+.2f}%',
+            'Monthly (%)': '{:+.2f}%',
+            '3M (%)': '{:+.2f}%',
+            'Market Cap (₹Cr)': '₹{:.0f}',
+            'Rev YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+            'Rev QoQ (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+            'Profit YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+            'Profit QoQ (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+            'Margin (%)': lambda x: f'{x:.1f}%' if pd.notna(x) else 'N/A',
+            'RSI': '{:.1f}',
+            'MACD': '{:.2f}',
+            'BB (%)': '{:.0f}%'
+        })
     
-    # Pattern Summary
-    st.markdown("---")
-    st.subheader("📊 Pattern Distribution")
-    
-    pattern_stats = {}
-    for r in results:
-        for p in r['patterns']:
-            pattern_name = p['name']
-            if pattern_name not in pattern_stats:
-                pattern_stats[pattern_name] = 0
-            pattern_stats[pattern_name] += 1
-    
-    if pattern_stats:
-        pattern_df = pd.DataFrame([
-            {'Pattern': k, 'Count': v} 
-            for k, v in sorted(pattern_stats.items(), key=lambda x: x[1], reverse=True)
-        ])
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.dataframe(pattern_df, use_container_width=True)
-        
-        with col2:
-            st.markdown("### Pattern Legend")
-            st.markdown("""
-            - ☕ Cup & Handle
-            - ⬇️⬇️ Double Bottom
-            - 📐 Ascending Triangle
-            - 🚀 52W Breakout
-            - 🆕 IPO Base
-            - 📉 VCP (Volatility Contraction)
-            - ➡️ Flat Base
-            - 🚩 High Tight Flag
-            """)
+    st.dataframe(styled_df, use_container_width=True, height=600)
     
     # Detailed view
     st.markdown("---")
@@ -885,30 +1064,23 @@ if st.session_state.scan_results:
         if selected_result:
             st.markdown(f"### {selected_symbol} - {selected_result['status']}")
             
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            if selected_result['is_operated']:
+                st.error(f"🚨 **OPERATOR DETECTED** - Risk: {selected_result['operator_risk']}/100")
+                for flag in selected_result['operator_flags']:
+                    st.warning(flag)
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Score", selected_result['score'])
             col2.metric("Price", f"₹{selected_result['price']:.2f}")
-            col3.metric("Change", f"{selected_result['change']:+.2f}%")
-            col4.metric("RSI", f"{selected_result['rsi']:.0f}")
-            col5.metric("Volume", f"{selected_result['vol']:.1f}x")
-            col6.metric("Patterns", selected_result['pattern_count'])
+            col3.metric("Market Cap", f"₹{selected_result['market_cap']:.0f}Cr")
+            col4.metric("Rev YoY", f"{selected_result['yoy_revenue_growth']:+.1f}%" if selected_result['yoy_revenue_growth'] else "N/A")
+            col5.metric("Profit YoY", f"{selected_result['yoy_profit_growth']:+.1f}%" if selected_result['yoy_profit_growth'] else "N/A")
             
-            if selected_result['patterns']:
-                st.markdown("#### 🎯 Detected Patterns")
-                pattern_cols = st.columns(min(3, len(selected_result['patterns'])))
-                for idx, pattern in enumerate(selected_result['patterns'][:3]):
-                    with pattern_cols[idx]:
-                        st.markdown(f"""
-                        <div class="metric-card">
-                            <h4>{pattern['name']}</h4>
-                            <p>Confidence: <strong>{pattern['confidence']:.0f}%</strong></p>
-                            <span class="pattern-badge pattern-{pattern['type']}">{pattern['type'].upper()}</span>
-                        </div>
-                        """, unsafe_allow_html=True)
-            
-            st.markdown("#### 📊 Scoring Breakdown")
+            st.markdown("#### Detailed Scoring Breakdown")
             for criterion in selected_result['criteria']:
-                if '✅' in criterion:
+                if '🚨' in criterion:
+                    st.error(criterion)
+                elif '✅' in criterion:
                     st.success(criterion)
                 elif '⚠' in criterion:
                     st.warning(criterion)
@@ -926,7 +1098,7 @@ if st.session_state.scan_results:
         st.download_button(
             "📥 Download Filtered CSV",
             csv,
-            f"pattern_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            f"ultra_strict_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "text/csv",
             use_container_width=True
         )
@@ -936,93 +1108,85 @@ if st.session_state.scan_results:
         st.download_button(
             "📥 Download All Results CSV",
             all_csv,
-            f"pattern_scan_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            f"ultra_strict_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "text/csv",
             use_container_width=True
         )
 
 else:
-    st.info("👈 Configure scanner and click 'START PATTERN SCAN' to begin")
+    st.info("👈 Configure and click 'FIND EXCEPTIONAL STOCKS' to start")
     
     st.markdown("---")
-    st.subheader("📚 Chart Pattern Guide")
+    st.subheader("🎯 Why ULTRA-STRICT Works")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("""
-        ### 🎯 Continuation Patterns
+        **NEW: Fundamental Analysis Added!**
         
-        **☕ Cup and Handle**
-        - U-shaped consolidation (12-33% deep)
-        - Handle forms in upper half
-        - Breakout above handle = buy signal
-        - Best when 7-65 weeks in formation
+        **4 Fundamental Criteria (80 pts):**
+        1. **Market Cap (15 pts)**
+           - Filters quality companies
+           - Large cap = More stable
         
-        **📉 VCP (Volatility Contraction)**
-        - Series of tightening pullbacks
-        - Each correction smaller than last
-        - 3-4 contractions ideal
-        - Breakout on volume
+        2. **Revenue Growth (25 pts)**
+           - YoY ≥20% + QoQ ≥10% = 22+ pts
+           - Must show consistent growth
         
-        **➡️ Flat Base**
-        - 5-8 weeks of tight consolidation
-        - 8-15% price range
-        - Near 52-week highs
-        - Low volatility
+        3. **Profit Growth (25 pts)**
+           - YoY ≥25% + QoQ ≥15% = 22+ pts
+           - Even stricter than revenue
         
-        **🚩 High Tight Flag**
-        - 100%+ gain in 4-8 weeks
-        - Tight 3-5 week consolidation
-        - <25% pullback
-        - Rare but powerful
+        4. **Profit Margin (15 pts)**
+           - ≥15% = Excellent (12+ pts)
+           - Shows business quality
+        
+        **Result:** Only 1-3% stocks pass ALL criteria!
         """)
     
     with col2:
         st.markdown("""
-        ### 🔄 Reversal Patterns
+        **Complete 14-Point System:**
         
-        **⬇️⬇️ Double Bottom**
-        - Two similar lows (within 3%)
-        - Separated by 4+ weeks
-        - Neckline breakout = buy
-        - Volume increases on breakout
+        **Fundamentals (80 pts)**
+        - Market cap quality
+        - Revenue acceleration
+        - Profit growth momentum
+        - Margin efficiency
         
-        **📐 Ascending Triangle**
-        - Flat resistance line
-        - Rising support line
-        - Breakout above resistance
-        - Bullish pattern
+        **Technicals (170 pts)**
+        - Institutional buying
+        - Perfect consolidation
+        - Oversold RSI (32-38)
+        - MACD crossover
+        - Lower BB bounce
+        - Accumulation volume
+        - Entry timing
+        - Trend confirmation
         
-        **🚀 52-Week Breakout**
-        - New 52-week highs
-        - Strong momentum
-        - Institutional interest
-        - Volume confirmation
-        
-        **🆕 IPO Base**
-        - First consolidation after IPO
-        - 15-25% range ideal
-        - Low volatility
-        - 8-12 weeks optimal
+        **Safety (Penalties)**
+        - Operator detection: -70 pts
+        - Risk penalties: up to -40 pts
         """)
     
     st.markdown("---")
-    st.markdown("""
-    ### 💡 Trading Tips
+    st.error("""
+    **⚠️ ULTRA-STRICT = TOP 1-3% ONLY:**
     
-    1. **Best Patterns**: Cup & Handle, VCP, IPO Base (when properly formed)
-    2. **Volume**: Always confirm breakouts with 40-50% above average volume
-    3. **Risk Management**: Set stop loss 5-8% below entry
-    4. **Position Sizing**: Risk only 1-2% of capital per trade
-    5. **Market Condition**: Patterns work best in uptrending markets
-    6. **Multiple Patterns**: Stocks with 2-3 patterns have higher success rate
+    With fundamentals + technicals:
+    - **1-3 stocks** out of 100 qualify (1-3%)
+    - Must have ≥140 points (Perfect fundamentals + technicals)
+    - **0-1 exceptional** (score ≥180)
+    - **1-2 excellent** (score 140-179)
+    
+    **Bottom Line:** We find the absolute BEST opportunities - companies with explosive growth + perfect technical setup!
     """)
 
 st.markdown("---")
 st.markdown("""
-<div style='text-align:center;color:#aaa;'>
-<p><strong>Pro Stock Scanner v2.0</strong> | Advanced Pattern Recognition</p>
-<p style='font-size:0.85rem;'>⚠️ Educational purposes only. Patterns are probabilistic, not guaranteed. Always do your own research.</p>
+<div style='text-align:center;color:#666;'>
+<p><strong>Ultra-Strict Scanner with Fundamentals</strong> | Top 1-3% Only</p>
+<p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice.</p>
 </div>
 """, unsafe_allow_html=True)
