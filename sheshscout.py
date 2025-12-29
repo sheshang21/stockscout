@@ -760,11 +760,11 @@ st.markdown("*Only stocks with EXCEPTIONAL fundamentals + technicals qualify*")
 st.sidebar.header("⚙ Scanner Configuration")
 
 scan_mode = st.sidebar.radio("Scan Mode", 
-    ["Quick Scan (50 stocks)", "Full Scan (100+ stocks)", "Custom List"])
+    ["Quick Scan (50 stocks)", "Full Scan (2000+ stocks)", "Custom List"])
 
 if scan_mode == "Quick Scan (50 stocks)":
     stocks_to_scan = NSE_STOCKS[:50]
-elif scan_mode == "Full Scan (100+ stocks)":
+elif scan_mode == "Full Scan (2000+ stocks)":
     stocks_to_scan = NSE_STOCKS
 else:
     custom_input = st.sidebar.text_area("Enter NSE symbols (one per line)", 
