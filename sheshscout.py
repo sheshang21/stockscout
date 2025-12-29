@@ -23,12 +23,44 @@ div[data-testid="stDataFrame"] > div{background:#f8f9fb}
 </style>""", unsafe_allow_html=True)
 
 # Comprehensive Stock Universe - 200+ NSE Stocks
-NSE_STOCKS = [
-                "20MICRONS", "21STCENMGM", "360ONE", "3IINFOLTD", "3MINDIA",  
-                "ZENSARTECH", "ZENTEC", "ZFCVINDIA", "ZIMLAB", "ZODIAC", 
-                "ZODIACLOTH", "ZOTA", "ZUARI", "ZUARIIND", "ZYDUSLIFE", 
-                "ZYDUSWELL"
-]
+
+# Load NSE Stocks from external file
+def load_nse_stocks():
+    """Load NSE stock symbols from nse_ticker.txt file"""
+    try:
+        with open('nse_ticker.txt', 'r') as f:
+            # Read all lines, strip whitespace, remove empty lines, and convert to uppercase
+            stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
+        
+        if not stocks:
+            st.error("⚠️ nse_ticker.txt is empty! Please add stock symbols (one per line)")
+            return []
+        
+        st.sidebar.success(f"✅ Loaded {len(stocks)} stocks from nse_ticker.txt")
+        return stocks
+    
+    except FileNotFoundError:
+        st.error("""
+        ⚠️ **nse_ticker.txt file not found!**
+        
+        Please create a file named `nse_ticker.txt` in the same directory as this script.
+        Add stock symbols one per line, for example:
+        ```
+        RELIANCE
+        TCS
+        INFY
+        HDFCBANK
+        ICICIBANK
+        ```
+        """)
+        return []
+    
+    except Exception as e:
+        st.error(f"❌ Error loading nse_ticker.txt: {str(e)}")
+        return []
+
+# Load stocks from file
+NSE_STOCKS = load_nse_stocks()
 
 SECTOR_MAP = {
     'RELIANCE': 'Energy', 'TCS': 'IT', 'HDFCBANK': 'Banking', 'INFY': 'IT', 'ICICIBANK': 'Banking',
