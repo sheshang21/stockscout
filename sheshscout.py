@@ -26,24 +26,24 @@ div[data-testid="stDataFrame"] > div{background:#f8f9fb}
 
 # Load NSE Stocks from external file
 def load_nse_stocks():
-    """Load NSE stock symbols from nse_ticker.txt file"""
+    """Load NSE stock symbols from nse_tickers.txt file"""
     try:
-        with open('nse_ticker.txt', 'r') as f:
+        with open('nse_tickers.txt', 'r') as f:
             # Read all lines, strip whitespace, remove empty lines, and convert to uppercase
             stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
         
         if not stocks:
-            st.error("⚠️ nse_ticker.txt is empty! Please add stock symbols (one per line)")
+            st.error("⚠️ nse_tickers.txt is empty! Please add stock symbols (one per line)")
             return []
         
-        st.sidebar.success(f"✅ Loaded {len(stocks)} stocks from nse_ticker.txt")
+        st.sidebar.success(f"✅ Loaded {len(stocks)} stocks from nse_tickers.txt")
         return stocks
     
     except FileNotFoundError:
         st.error("""
-        ⚠️ **nse_ticker.txt file not found!**
+        ⚠️ **nse_tickers.txt file not found!**
         
-        Please create a file named `nse_ticker.txt` in the same directory as this script.
+        Please create a file named `nse_tickers.txt` in the same directory as this script.
         Add stock symbols one per line, for example:
         ```
         RELIANCE
@@ -56,7 +56,7 @@ def load_nse_stocks():
         return []
     
     except Exception as e:
-        st.error(f"❌ Error loading nse_ticker.txt: {str(e)}")
+        st.error(f"❌ Error loading nse_tickers.txt: {str(e)}")
         return []
 
 # Load stocks from file
