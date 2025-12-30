@@ -768,7 +768,7 @@ elif scan_mode == "Full Scan (2000+ stocks)":
     stocks_to_scan = NSE_STOCKS
 else:
     custom_input = st.sidebar.text_area("Enter NSE symbols (one per line)", 
-        "WITHOUT ".NS"", height=150)
+        'WITHOUT ".NS"', height=150)
     stocks_to_scan = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
 
 st.sidebar.markdown("---")
