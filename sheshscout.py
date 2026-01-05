@@ -286,7 +286,7 @@ def detect_operator_activity(data):
     warning_flags = []
     risk_score = 0
     
-    if len(closes) < 20:
+    if len(closes) < 21:
         return False, [], 0
     
     # 1. EXTREME VOLUME SPIKES
@@ -318,13 +318,14 @@ def detect_operator_activity(data):
         warning_flags.append("⚠️ High volatility - Possible manipulation")
         risk_score += 12
     
-    # 3. CIRCUIT FILTER HITS - FIXED INDEX ERROR
+    # 3. CIRCUIT FILTER HITS
     circuit_hits = 0
-    # Start from index 1 to avoid accessing index -1 when i=0
-    for i in range(max(1, len(closes) - 20), len(closes)):
-        daily_change = abs((closes[i] - closes[i-1]) / closes[i-1]) * 100
-        if daily_change > 9:
-            circuit_hits += 1
+    for i in range(-20, 0):
+        # Ensure both i and i-1 are valid indices
+        if i >= -len(closes) and (i-1) >= -len(closes):
+            daily_change = abs((closes[i] - closes[i-1]) / closes[i-1]) * 100
+            if daily_change > 9:
+                circuit_hits += 1
     
     if circuit_hits >= 3:
         warning_flags.append("🚨 Multiple circuit hits - Highly manipulated")
