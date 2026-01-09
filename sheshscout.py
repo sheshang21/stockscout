@@ -5,6 +5,8 @@ import numpy as np
 from datetime import datetime, timedelta
 import warnings
 import time
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 warnings.filterwarnings('ignore')
 
@@ -104,6 +106,27 @@ def fetch_stock_data(symbol):
         roe = info.get('returnOnEquity', None)
         debt_to_equity = info.get('debtToEquity', None)
         
+        # CASH METRICS
+        total_cash = info.get('totalCash', 0)
+        
+        # Get LATEST REPORTED FY REVENUE (most recent completed FY)
+        latest_fy_revenue = 0
+        try:
+            annual_financials = ticker.financials
+            if annual_financials is not None and not annual_financials.empty:
+                if 'Total Revenue' in annual_financials.index:
+                    # iloc[0] gets the MOST RECENT fiscal year
+                    latest_fy_revenue = annual_financials.loc['Total Revenue'].iloc[0]
+        except:
+            latest_fy_revenue = 0
+        
+        # Calculate ratios
+        cash_on_hand_to_mcap = (total_cash / market_cap * 100) if market_cap > 0 and total_cash > 0 else 0
+        latest_fy_revenue_to_mcap = (latest_fy_revenue / market_cap) if market_cap > 0 and latest_fy_revenue > 0 else 0
+        
+        # Get 3-year historical data
+        historical_data = get_historical_financials(ticker, market_cap)
+        
         # Get quarterly financials for growth analysis
         try:
             financials = ticker.quarterly_financials
@@ -183,6 +206,11 @@ def fetch_stock_data(symbol):
             'pe_ratio': pe_ratio,
             'roe': roe,
             'debt_to_equity': debt_to_equity,
+            'total_cash': total_cash,
+            'latest_fy_revenue': latest_fy_revenue,
+            'cash_on_hand_to_mcap': cash_on_hand_to_mcap,
+            'latest_fy_revenue_to_mcap': latest_fy_revenue_to_mcap,
+            'historical_data': historical_data,
             'qoq_revenue_growth': qoq_revenue_growth,
             'yoy_revenue_growth': yoy_revenue_growth,
             'qoq_profit_growth': qoq_profit_growth,
@@ -190,6 +218,57 @@ def fetch_stock_data(symbol):
         }
     except Exception as e:
         return None
+
+def get_historical_financials(ticker, current_mcap):
+    """Get 3-year historical revenue, cash, and sales/mcap data"""
+    try:
+        financials = ticker.financials
+        balance_sheet = ticker.balance_sheet  # ANNUAL balance sheet, not quarterly
+        
+        historical = {
+            'years': [],
+            'revenues': [],
+            'cash_amounts': [],
+            'sales_to_mcap': []
+        }
+        
+        if financials is not None and not financials.empty:
+            years = financials.columns[:3] if len(financials.columns) >= 3 else financials.columns
+            
+            for year in years:
+                year_str = year.strftime('%Y') if hasattr(year, 'strftime') else str(year)
+                historical['years'].append(year_str)
+                
+                # Revenue
+                if 'Total Revenue' in financials.index:
+                    revenue = financials.loc['Total Revenue', year]
+                    historical['revenues'].append(revenue if pd.notna(revenue) else 0)
+                else:
+                    historical['revenues'].append(0)
+                
+                # Cash from ANNUAL balance sheet (same source as table)
+                if balance_sheet is not None and not balance_sheet.empty and year in balance_sheet.columns:
+                    if 'Cash And Cash Equivalents' in balance_sheet.index:
+                        cash = balance_sheet.loc['Cash And Cash Equivalents', year]
+                        historical['cash_amounts'].append(cash if pd.notna(cash) else 0)
+                    elif 'Cash Cash Equivalents And Short Term Investments' in balance_sheet.index:
+                        cash = balance_sheet.loc['Cash Cash Equivalents And Short Term Investments', year]
+                        historical['cash_amounts'].append(cash if pd.notna(cash) else 0)
+                    else:
+                        historical['cash_amounts'].append(0)
+                else:
+                    historical['cash_amounts'].append(0)
+        
+        # Calculate Sales to Market Cap
+        for revenue in historical['revenues']:
+            if current_mcap > 0 and revenue > 0:
+                historical['sales_to_mcap'].append(revenue / current_mcap)
+            else:
+                historical['sales_to_mcap'].append(0)
+        
+        return historical
+    except:
+        return {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []}
 
 def fetch_live_price(symbol):
     """Fetch only live price for auto-refresh (non-cached)"""
@@ -286,7 +365,7 @@ def detect_operator_activity(data):
     warning_flags = []
     risk_score = 0
     
-    if len(closes) < 21:
+    if len(closes) < 20:
         return False, [], 0
     
     # 1. EXTREME VOLUME SPIKES
@@ -321,8 +400,7 @@ def detect_operator_activity(data):
     # 3. CIRCUIT FILTER HITS
     circuit_hits = 0
     for i in range(-20, 0):
-        # Ensure both i and i-1 are valid indices
-        if i >= -len(closes) and (i-1) >= -len(closes):
+        if i >= -len(closes):
             daily_change = abs((closes[i] - closes[i-1]) / closes[i-1]) * 100
             if daily_change > 9:
                 circuit_hits += 1
@@ -750,7 +828,12 @@ def analyze_stock(data, min_market_cap):
         'qoq_revenue_growth': qoq_rev,
         'yoy_profit_growth': yoy_profit,
         'qoq_profit_growth': qoq_profit,
-        'profit_margin': profit_margin * 100 if profit_margin else None
+        'profit_margin': profit_margin * 100 if profit_margin else None,
+        'total_cash': data.get('total_cash', 0),
+        'latest_fy_revenue': data.get('latest_fy_revenue', 0),
+        'cash_on_hand_to_mcap': data.get('cash_on_hand_to_mcap', 0),
+        'latest_fy_revenue_to_mcap': data.get('latest_fy_revenue_to_mcap', 0),
+        'historical_data': data.get('historical_data', {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []})
     }
 
 # Main App
@@ -949,6 +1032,9 @@ if st.session_state.scan_results:
         'Monthly (%)': r['monthly_change'],
         '3M (%)': r['three_month_change'],
         'Market Cap (₹Cr)': r['market_cap'],
+        'Cash/Hand (₹Cr)': r.get('total_cash', 0) / 10000000,
+        'CashHand/MCap (%)': r.get('cash_on_hand_to_mcap', 0),
+        'LatestFY Rev/MCap': r.get('latest_fy_revenue_to_mcap', 0),
         'Rev YoY (%)': r['yoy_revenue_growth'],
         'Rev QoQ (%)': r['qoq_revenue_growth'],
         'Profit YoY (%)': r['yoy_profit_growth'],
@@ -1058,6 +1144,9 @@ if st.session_state.scan_results:
             'Monthly (%)': '{:+.2f}%',
             '3M (%)': '{:+.2f}%',
             'Market Cap (₹Cr)': '₹{:.0f}',
+            'Cash/Hand (₹Cr)': '₹{:.0f}',
+            'CashHand/MCap (%)': '{:.2f}%',
+            'LatestFY Rev/MCap': '{:.2f}x',
             'Rev YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
             'Rev QoQ (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
             'Profit YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
@@ -1093,6 +1182,87 @@ if st.session_state.scan_results:
             col4.metric("Rev YoY", f"{selected_result['yoy_revenue_growth']:+.1f}%" if selected_result['yoy_revenue_growth'] else "N/A")
             col5.metric("Profit YoY", f"{selected_result['yoy_profit_growth']:+.1f}%" if selected_result['yoy_profit_growth'] else "N/A")
             
+            # Cash metrics
+            st.markdown("---")
+            st.markdown("**💵 Financial Ratios**")
+            cash_col1, cash_col2, cash_col3 = st.columns(3)
+            cash_col1.metric("Cash on Hand", f"₹{selected_result.get('total_cash', 0)/10000000:.0f}Cr")
+            cash_col2.metric("Cash/MCap Ratio", f"{selected_result.get('cash_on_hand_to_mcap', 0):.2f}%")
+            cash_col3.metric("LatestFY Rev/MCap", f"{selected_result.get('latest_fy_revenue_to_mcap', 0):.2f}x")
+            
+            # 3-YEAR HISTORICAL GRAPHS
+            if selected_result.get('historical_data') and selected_result['historical_data']['years']:
+                st.markdown("---")
+                st.markdown("**📈 3-Year Historical Trends**")
+                
+                historical = selected_result['historical_data']
+                
+                fig = make_subplots(
+                    rows=3, cols=1,
+                    subplot_titles=('YoY Revenue (₹ Cr)', 'Cash Amounts (₹ Cr)', 'Sales to Market Cap Ratio'),
+                    vertical_spacing=0.12
+                )
+                
+                # Revenue graph
+                if historical['revenues']:
+                    fig.add_trace(
+                        go.Bar(
+                            x=historical['years'],
+                            y=[r/10000000 for r in historical['revenues']],
+                            name='Revenue',
+                            marker_color='lightblue',
+                            text=[f"₹{r/10000000:.0f}Cr" for r in historical['revenues']],
+                            textposition='auto'
+                        ),
+                        row=1, col=1
+                    )
+                
+                # Cash graph
+                if historical['cash_amounts']:
+                    fig.add_trace(
+                        go.Bar(
+                            x=historical['years'],
+                            y=[c/10000000 for c in historical['cash_amounts']],
+                            name='Cash',
+                            marker_color='lightgreen',
+                            text=[f"₹{c/10000000:.0f}Cr" for c in historical['cash_amounts']],
+                            textposition='auto'
+                        ),
+                        row=2, col=1
+                    )
+                
+                # Sales to MCap graph
+                if historical['sales_to_mcap']:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=historical['years'],
+                            y=historical['sales_to_mcap'],
+                            name='Sales/MCap',
+                            mode='lines+markers',
+                            line=dict(color='orange', width=3),
+                            marker=dict(size=10),
+                            text=[f"{s:.2f}x" for s in historical['sales_to_mcap']],
+                            textposition='top center'
+                        ),
+                        row=3, col=1
+                    )
+                
+                fig.update_layout(
+                    height=900,
+                    showlegend=False,
+                    title_text=f"{selected_symbol} - 3-Year Financial Trends"
+                )
+                
+                fig.update_yaxes(title_text="Revenue (₹ Cr)", row=1, col=1)
+                fig.update_yaxes(title_text="Cash (₹ Cr)", row=2, col=1)
+                fig.update_yaxes(title_text="Ratio", row=3, col=1)
+                fig.update_xaxes(title_text="Year", row=3, col=1)
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("📊 Historical data not available for this stock")
+            
+            st.markdown("---")
             st.markdown("#### Detailed Scoring Breakdown")
             for criterion in selected_result['criteria']:
                 if '🚨' in criterion:
