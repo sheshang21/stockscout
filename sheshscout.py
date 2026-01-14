@@ -7,8 +7,13 @@ import warnings
 import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import logging
 
+# Configure logging to show warnings but not info
 warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
 
 st.set_page_config(page_title="Indian Stock Scout - Ultra-Strict Scanner", page_icon="🎯", layout="wide")
 
@@ -26,44 +31,6 @@ div[data-testid="stDataFrame"] > div{background:#f8f9fb}
 
 # Comprehensive Stock Universe - 200+ NSE Stocks
 
-# Load NSE Stocks from external file
-def load_nse_stocks():
-    """Load NSE stock symbols from nse_tickers.txt file"""
-    try:
-        with open('nse_tickers.txt', 'r') as f:
-            # Read all lines, strip whitespace, remove empty lines, and convert to uppercase
-            stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
-        
-        if not stocks:
-            st.error("⚠️ nse_tickers.txt is empty! Please add stock symbols (one per line)")
-            return []
-        
-        st.sidebar.success(f"✅ Loaded {len(stocks)} stocks from nse_tickers.txt")
-        return stocks
-    
-    except FileNotFoundError:
-        st.error("""
-        ⚠️ **nse_tickers.txt file not found!**
-        
-        Please create a file named `nse_tickers.txt` in the same directory as this script.
-        Add stock symbols one per line, for example:
-        ```
-        RELIANCE
-        TCS
-        INFY
-        HDFCBANK
-        ICICIBANK
-        ```
-        """)
-        return []
-    
-    except Exception as e:
-        st.error(f"❌ Error loading nse_tickers.txt: {str(e)}")
-        return []
-
-# Load stocks from file
-NSE_STOCKS = load_nse_stocks()
-
 SECTOR_MAP = {
     'RELIANCE': 'Energy', 'TCS': 'IT', 'HDFCBANK': 'Banking', 'INFY': 'IT', 'ICICIBANK': 'Banking',
     'HINDUNILVR': 'FMCG', 'ITC': 'FMCG', 'SBIN': 'Banking', 'BHARTIARTL': 'Telecom', 'KOTAKBANK': 'Banking',
@@ -73,11 +40,33 @@ SECTOR_MAP = {
     'JSWSTEEL': 'Metals', 'M&M': 'Auto', 'TECHM': 'IT', 'ADANIENT': 'Conglomerate', 'ADANIPORTS': 'Infrastructure'
 }
 
+# BULLETPROOF: Retry wrapper with exponential backoff
+def bulletproof_fetch(func, *args, max_retries=3, initial_delay=1, **kwargs):
+    """Wrapper that adds retry logic with exponential backoff to any function"""
+    for attempt in range(max_retries):
+        try:
+            # Add small delay before each attempt to avoid rate limiting
+            if attempt > 0:
+                time.sleep(initial_delay * (2 ** (attempt - 1)))  # Exponential backoff
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                # Last attempt failed, return None silently
+                return None
+            # Continue to next attempt
+            time.sleep(initial_delay * (2 ** attempt))
+    return None
+
 @st.cache_data(ttl=300)
 def fetch_stock_data(symbol):
-    """Fetch real-time data from Yahoo Finance with fundamentals"""
+    """Fetch real-time data from Yahoo Finance with fundamentals
+    
+    EXACT structure from original sheshscout.py - simple and clean
+    Symbol comes WITHOUT .NS/.BO, function adds it based on what's in the symbol
+    """
     try:
-        ticker = yf.Ticker(f"{symbol}.NS")
+        # Symbol already has .NS or .BO added during loading
+        ticker = yf.Ticker(symbol)
         hist = ticker.history(period="3mo", interval="1d")
         
         if hist.empty:
@@ -117,10 +106,12 @@ def fetch_stock_data(symbol):
                 if 'Total Revenue' in annual_financials.index:
                     # iloc[0] gets the MOST RECENT fiscal year
                     latest_fy_revenue = annual_financials.loc['Total Revenue'].iloc[0]
+                    if pd.isna(latest_fy_revenue):
+                        latest_fy_revenue = 0
         except:
             latest_fy_revenue = 0
         
-        # Calculate ratios
+        # Calculate ratios - BULLETPROOF: Safe division
         cash_on_hand_to_mcap = (total_cash / market_cap * 100) if market_cap > 0 and total_cash > 0 else 0
         latest_fy_revenue_to_mcap = (latest_fy_revenue / market_cap) if market_cap > 0 and latest_fy_revenue > 0 else 0
         
@@ -134,8 +125,11 @@ def fetch_stock_data(symbol):
                 # Get Total Revenue if available
                 if 'Total Revenue' in financials.index:
                     revenues = financials.loc['Total Revenue'].values
+                    # BULLETPROOF: Filter out NaN values
+                    revenues = [r for r in revenues if not pd.isna(r)]
+                    
                     if len(revenues) >= 4:
-                        # Calculate QoQ and YoY growth
+                        # Calculate QoQ and YoY growth - BULLETPROOF: Safe division
                         qoq_revenue_growth = ((revenues[0] - revenues[1]) / abs(revenues[1])) * 100 if revenues[1] != 0 else None
                         yoy_revenue_growth = ((revenues[0] - revenues[3]) / abs(revenues[3])) * 100 if len(revenues) >= 4 and revenues[3] != 0 else None
                     else:
@@ -148,6 +142,9 @@ def fetch_stock_data(symbol):
                 # Get Net Income if available
                 if 'Net Income' in financials.index:
                     profits = financials.loc['Net Income'].values
+                    # BULLETPROOF: Filter out NaN values
+                    profits = [p for p in profits if not pd.isna(p)]
+                    
                     if len(profits) >= 4:
                         qoq_profit_growth = ((profits[0] - profits[1]) / abs(profits[1])) * 100 if profits[1] != 0 else None
                         yoy_profit_growth = ((profits[0] - profits[3]) / abs(profits[3])) * 100 if len(profits) >= 4 and profits[3] != 0 else None
@@ -177,13 +174,13 @@ def fetch_stock_data(symbol):
         vol_multiple = calculate_volume_multiple(volumes)
         trend = detect_trend(closes)
         
-        # Calculate timeframe changes
-        weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
-        monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
-        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 else 0
+        # Calculate timeframe changes - BULLETPROOF: Safe division
+        weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] != 0 else 0
+        monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 and closes[-20] != 0 else 0
+        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 and closes[0] != 0 else 0
         
         return {
-            'symbol': symbol,
+            'symbol': symbol,  # Use the symbol as-is (already has .NS or .BO)
             'price': price,
             'change': change,
             'weekly_change': weekly_change,
@@ -259,7 +256,7 @@ def get_historical_financials(ticker, current_mcap):
                 else:
                     historical['cash_amounts'].append(0)
         
-        # Calculate Sales to Market Cap
+        # Calculate Sales to Market Cap - BULLETPROOF: Safe division
         for revenue in historical['revenues']:
             if current_mcap > 0 and revenue > 0:
                 historical['sales_to_mcap'].append(revenue / current_mcap)
@@ -271,11 +268,15 @@ def get_historical_financials(ticker, current_mcap):
         return {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []}
 
 def fetch_live_price(symbol):
-    """Fetch only live price for auto-refresh (non-cached)"""
+    """Fetch only live price for auto-refresh (non-cached)
+    
+    Symbol already has .NS or .BO suffix from file loading
+    """
     try:
-        ticker = yf.Ticker(f"{symbol}.NS")
+        # Symbol already has exchange suffix (e.g., "RELIANCE.NS" or "TCS.BO")
+        ticker = yf.Ticker(symbol)
         data = ticker.history(period="1d", interval="1m")
-        if not data.empty:
+        if data is not None and not data.empty:
             return data['Close'].iloc[-1]
         return None
     except:
@@ -283,583 +284,794 @@ def fetch_live_price(symbol):
 
 def detect_institutional_activity(volumes, closes):
     """Detect FII/DII activity patterns from volume and price action"""
-    if len(volumes) < 20 or len(closes) < 20:
-        return 0
-    
-    score = 0
-    recent_days = 10
-    
-    for i in range(-recent_days, 0):
-        vol_ratio = volumes[i] / np.mean(volumes[-60:]) if len(volumes) >= 60 else volumes[i] / np.mean(volumes)
-        price_change = ((closes[i] - closes[i-1]) / closes[i-1]) * 100 if i > -len(closes) else 0
+    try:
+        if len(volumes) < 20 or len(closes) < 20:
+            return 0
         
-        if vol_ratio > 1.5 and price_change > 1:
-            score += 2
-        elif vol_ratio > 1.2 and price_change > 0.5:
-            score += 1
-        elif vol_ratio > 1.5 and price_change < -1:
-            score -= 2
-        elif vol_ratio > 1.2 and price_change < -0.5:
-            score -= 1
-    
-    return score
+        score = 0
+        recent_days = 10
+        
+        for i in range(-recent_days, 0):
+            # BULLETPROOF: Safe array access and division
+            if i >= -len(volumes) and i >= -len(closes):
+                vol_ratio = volumes[i] / np.mean(volumes[-60:]) if len(volumes) >= 60 else volumes[i] / np.mean(volumes)
+                if vol_ratio == 0 or np.isnan(vol_ratio):
+                    continue
+                    
+                if i > -len(closes) and closes[i-1] != 0:
+                    price_change = ((closes[i] - closes[i-1]) / closes[i-1]) * 100
+                else:
+                    price_change = 0
+                
+                if vol_ratio > 1.5 and price_change > 1:
+                    score += 2
+                elif vol_ratio > 1.2 and price_change > 0.5:
+                    score += 1
+                elif vol_ratio > 1.5 and price_change < -1:
+                    score -= 2
+                elif vol_ratio > 1.2 and price_change < -0.5:
+                    score -= 1
+        
+        return score
+    except:
+        return 0
 
 def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
+    try:
+        if len(prices) < period + 1:
+            return 50
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains[-period:])
+        avg_loss = np.mean(losses[-period:])
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    except:
         return 50
-    deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
 
 def calculate_macd(prices):
-    if len(prices) < 26:
+    try:
+        if len(prices) < 26:
+            return 0
+        ema12 = calculate_ema(prices, 12)
+        ema26 = calculate_ema(prices, 26)
+        return ema12 - ema26
+    except:
         return 0
-    ema12 = calculate_ema(prices, 12)
-    ema26 = calculate_ema(prices, 26)
-    return ema12 - ema26
 
 def calculate_ema(prices, period):
-    multiplier = 2 / (period + 1)
-    ema = np.mean(prices[:period])
-    for price in prices[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
+    try:
+        multiplier = 2 / (period + 1)
+        ema = np.mean(prices[:period])
+        for price in prices[period:]:
+            ema = (price - ema) * multiplier + ema
+        return ema
+    except:
+        return 0
 
 def calculate_bb_position(prices, period=20):
-    if len(prices) < period:
+    try:
+        if len(prices) < period:
+            return 50
+        recent = prices[-period:]
+        sma = np.mean(recent)
+        std = np.std(recent)
+        upper = sma + (2 * std)
+        lower = sma - (2 * std)
+        current = prices[-1]
+        if upper == lower:
+            return 50
+        position = ((current - lower) / (upper - lower)) * 100
+        return max(0, min(100, position))
+    except:
         return 50
-    recent = prices[-period:]
-    sma = np.mean(recent)
-    std = np.std(recent)
-    upper = sma + (2 * std)
-    lower = sma - (2 * std)
-    current = prices[-1]
-    if upper == lower:
-        return 50
-    position = ((current - lower) / (upper - lower)) * 100
-    return max(0, min(100, position))
 
 def calculate_volume_multiple(volumes):
-    if len(volumes) < 20:
+    try:
+        if len(volumes) < 20:
+            return 1.0
+        current = volumes[-1]
+        avg20 = np.mean(volumes[-20:])
+        if avg20 == 0:
+            return 1.0
+        return current / avg20
+    except:
         return 1.0
-    current = volumes[-1]
-    avg20 = np.mean(volumes[-20:])
-    if avg20 == 0:
-        return 1.0
-    return current / avg20
 
 def detect_operator_activity(data):
     """Detect if stock shows signs of operator/manipulator activity"""
-    closes = data['closes']
-    volumes = data['volumes']
-    highs = data['highs']
-    lows = data['lows']
-    
-    warning_flags = []
-    risk_score = 0
-    
-    if len(closes) < 20:
+    try:
+        closes = data['closes']
+        volumes = data['volumes']
+        highs = data['highs']
+        lows = data['lows']
+        
+        warning_flags = []
+        risk_score = 0
+        
+        if len(closes) < 20:
+            return False, [], 0
+        
+        # 1. EXTREME VOLUME SPIKES - BULLETPROOF: Safe operations
+        recent_vols = volumes[-10:]
+        avg_vol = np.mean(volumes[-60:]) if len(volumes) >= 60 else np.mean(volumes)
+        if avg_vol == 0:
+            return False, [], 0
+            
+        max_recent_vol = np.max(recent_vols)
+        
+        if max_recent_vol > avg_vol * 5:
+            warning_flags.append("🚨 EXTREME volume spike (>5x avg) - Possible pump")
+            risk_score += 30
+        elif max_recent_vol > avg_vol * 3:
+            warning_flags.append("⚠️ High volume spike (>3x avg) - Monitor closely")
+            risk_score += 15
+        
+        # 2. PRICE VOLATILITY
+        recent_prices = closes[-10:]
+        price_swings = []
+        for i in range(1, len(recent_prices)):
+            if recent_prices[i-1] != 0:
+                swing = abs((recent_prices[i] - recent_prices[i-1]) / recent_prices[i-1]) * 100
+                price_swings.append(swing)
+        
+        avg_swing = np.mean(price_swings) if price_swings else 0
+        max_swing = np.max(price_swings) if price_swings else 0
+        
+        if max_swing > 8 and avg_swing > 3:
+            warning_flags.append("🚨 Extreme volatility (>8% swings) - Operator activity likely")
+            risk_score += 25
+        elif max_swing > 5 and avg_swing > 2:
+            warning_flags.append("⚠️ High volatility - Possible manipulation")
+            risk_score += 12
+        
+        # 3. CIRCUIT FILTER HITS
+        circuit_hits = 0
+        for i in range(-20, 0):
+            if i >= -len(closes) and i > -len(closes) and closes[i-1] != 0:
+                daily_change = abs((closes[i] - closes[i-1]) / closes[i-1]) * 100
+                if daily_change > 9:
+                    circuit_hits += 1
+        
+        if circuit_hits >= 3:
+            warning_flags.append("🚨 Multiple circuit hits - Highly manipulated")
+            risk_score += 30
+        elif circuit_hits >= 2:
+            warning_flags.append("⚠️ Circuit hits detected - High risk")
+            risk_score += 15
+        
+        is_operated = risk_score >= 40
+        
+        return is_operated, warning_flags, risk_score
+    except:
         return False, [], 0
-    
-    # 1. EXTREME VOLUME SPIKES
-    recent_vols = volumes[-10:]
-    avg_vol = np.mean(volumes[-60:]) if len(volumes) >= 60 else np.mean(volumes)
-    max_recent_vol = np.max(recent_vols)
-    
-    if max_recent_vol > avg_vol * 5:
-        warning_flags.append("🚨 EXTREME volume spike (>5x avg) - Possible pump")
-        risk_score += 30
-    elif max_recent_vol > avg_vol * 3:
-        warning_flags.append("⚠️ High volume spike (>3x avg) - Monitor closely")
-        risk_score += 15
-    
-    # 2. PRICE VOLATILITY
-    recent_prices = closes[-10:]
-    price_swings = []
-    for i in range(1, len(recent_prices)):
-        swing = abs((recent_prices[i] - recent_prices[i-1]) / recent_prices[i-1]) * 100
-        price_swings.append(swing)
-    
-    avg_swing = np.mean(price_swings) if price_swings else 0
-    max_swing = np.max(price_swings) if price_swings else 0
-    
-    if max_swing > 8 and avg_swing > 3:
-        warning_flags.append("🚨 Extreme volatility (>8% swings) - Operator activity likely")
-        risk_score += 25
-    elif max_swing > 5 and avg_swing > 2:
-        warning_flags.append("⚠️ High volatility - Possible manipulation")
-        risk_score += 12
-    
-    # 3. CIRCUIT FILTER HITS
-    circuit_hits = 0
-    for i in range(-20, 0):
-        if i >= -len(closes):
-            daily_change = abs((closes[i] - closes[i-1]) / closes[i-1]) * 100
-            if daily_change > 9:
-                circuit_hits += 1
-    
-    if circuit_hits >= 3:
-        warning_flags.append("🚨 Multiple circuit hits - Highly manipulated")
-        risk_score += 30
-    elif circuit_hits >= 2:
-        warning_flags.append("⚠️ Circuit hits detected - High risk")
-        risk_score += 15
-    
-    is_operated = risk_score >= 40
-    
-    return is_operated, warning_flags, risk_score
 
 def detect_trend(prices):
-    if len(prices) < 5:
-        return 'Sideways'
-    recent = prices[-5:]
-    ups = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
-    if ups >= 4:
-        return 'Strong Uptrend'
-    elif ups >= 3:
-        return 'Uptrend'
-    elif ups <= 1:
-        return 'Downtrend'
-    else:
+    try:
+        if len(prices) < 5:
+            return 'Sideways'
+        recent = prices[-5:]
+        ups = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
+        if ups >= 4:
+            return 'Strong Uptrend'
+        elif ups >= 3:
+            return 'Uptrend'
+        elif ups <= 1:
+            return 'Downtrend'
+        else:
+            return 'Sideways'
+    except:
         return 'Sideways'
 
-def analyze_stock(data, min_market_cap):
-    """Analyze stock with ULTRA-STRICT fundamentals criteria"""
-    if not data:
-        return None
+def analyze_stock(data, min_market_cap, thresholds=None):
+    """Analyze stock with ULTRA-STRICT fundamentals criteria
     
-    price = data['price']
-    change = data['change']
-    rsi = data['rsi']
-    macd = data['macd']
-    bb = data['bb_position']
-    vol = data['vol_multiple']
-    trend = data['trend']
-    closes = data['closes']
-    
-    # Market cap filter (in crores)
-    market_cap = data['market_cap'] / 10000000 if data['market_cap'] else 0
-    
-    # Skip if below minimum market cap
-    if market_cap < min_market_cap:
-        return None
-    
-    # OPERATOR DETECTION
-    is_operated, operator_flags, operator_risk = detect_operator_activity(data)
-    
-    # Calculate additional indicators
-    weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
-    monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 else 0
-    three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 else 0
-    
-    potential_rs = max(20, price * 0.10)
-    potential_pct = (potential_rs / price) * 100
-    
-    score = 0
-    criteria = []
-    
-    # CRITICAL: Operator penalty
-    if is_operated:
-        score -= 70
-        criteria.append(f'🚨 OPERATOR DETECTED: Risk Score {operator_risk}/100 - AVOID [-70 pts]')
-    elif operator_risk >= 30:
-        score -= 40
-        criteria.append(f'🚨 VERY HIGH RISK: Major manipulation signs (Risk: {operator_risk}/100) [-40 pts]')
-    elif operator_risk >= 20:
-        score -= 25
-        criteria.append(f'⚠️ HIGH RISK: Manipulation signs detected (Risk: {operator_risk}/100) [-25 pts]')
-    elif operator_risk >= 12:
-        score -= 12
-        criteria.append(f'⚠️ CAUTION: Some manipulation indicators (Risk: {operator_risk}/100) [-12 pts]')
-    
-    # 1. MARKET CAP QUALITY (15 pts) - NEW!
-    if market_cap >= 50000:
-        score += 15
-        criteria.append(f'✅ Market Cap: Large Cap (₹{market_cap:.0f} Cr) [15 pts]')
-    elif market_cap >= 20000:
-        score += 12
-        criteria.append(f'✅ Market Cap: Mid-Large Cap (₹{market_cap:.0f} Cr) [12 pts]')
-    elif market_cap >= 10000:
-        score += 10
-        criteria.append(f'✅ Market Cap: Mid Cap (₹{market_cap:.0f} Cr) [10 pts]')
-    elif market_cap >= 5000:
-        score += 7
-        criteria.append(f'⚠ Market Cap: Small-Mid Cap (₹{market_cap:.0f} Cr) [7 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ Market Cap: Small Cap (₹{market_cap:.0f} Cr) [0 pts]')
-    
-    # 2. REVENUE GROWTH (25 pts) - NEW! STRICTEST CRITERIA
-    yoy_rev = data['yoy_revenue_growth']
-    qoq_rev = data['qoq_revenue_growth']
-    
-    if yoy_rev is not None and qoq_rev is not None:
-        if yoy_rev >= 25 and qoq_rev >= 15:
-            score += 25
-            criteria.append(f'✅ Revenue: EXCEPTIONAL Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [25 pts]')
-        elif yoy_rev >= 20 and qoq_rev >= 10:
-            score += 22
-            criteria.append(f'✅ Revenue: Excellent Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [22 pts]')
-        elif yoy_rev >= 15 and qoq_rev >= 8:
-            score += 18
-            criteria.append(f'✅ Revenue: Strong Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [18 pts]')
-        elif yoy_rev >= 10 and qoq_rev >= 5:
-            score += 12
-            criteria.append(f'⚠ Revenue: Good Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [12 pts]')
-        elif yoy_rev >= 5:
-            score += 5
-            criteria.append(f'⚠ Revenue: Moderate Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [5 pts]')
-        else:
-            score += 0
-            criteria.append(f'❌ Revenue: Weak/Negative Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [0 pts]')
-    elif yoy_rev is not None:
-        if yoy_rev >= 20:
-            score += 20
-            criteria.append(f'✅ Revenue: Strong YoY Growth ({yoy_rev:.1f}%) [20 pts]')
-        elif yoy_rev >= 12:
+    Args:
+        data: Stock data dictionary
+        min_market_cap: Minimum market cap filter
+        thresholds: Dictionary of adjustable thresholds (optional)
+    """
+    try:
+        if not data:
+            return None
+        
+        # Default thresholds if not provided
+        if thresholds is None:
+            thresholds = {
+                'threshold_exceptional': 180,
+                'threshold_prime': 160,
+                'threshold_excellent': 140,
+                'threshold_strong': 120,
+                'rsi_low': 32,
+                'rsi_high': 38,
+                'min_revenue_yoy': 20,
+                'min_profit_yoy': 25
+            }
+        
+        price = data['price']
+        change = data['change']
+        rsi = data['rsi']
+        macd = data['macd']
+        bb = data['bb_position']
+        vol = data['vol_multiple']
+        trend = data['trend']
+        closes = data['closes']
+        
+        # Market cap filter (in crores) - BULLETPROOF: Safe division
+        market_cap = data['market_cap'] / 10000000 if data['market_cap'] else 0
+        
+        # Skip if below minimum market cap
+        if market_cap < min_market_cap:
+            return None
+        
+        # OPERATOR DETECTION
+        is_operated, operator_flags, operator_risk = detect_operator_activity(data)
+        
+        # Calculate additional indicators - BULLETPROOF: Safe division
+        weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] != 0 else 0
+        monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 and closes[-20] != 0 else 0
+        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 and closes[0] != 0 else 0
+        
+        potential_rs = max(20, price * 0.10)
+        potential_pct = (potential_rs / price) * 100 if price != 0 else 0
+        
+        score = 0
+        criteria = []
+        
+        # CRITICAL: Operator penalty
+        if is_operated:
+            score -= 70
+            criteria.append(f'🚨 OPERATOR DETECTED: Risk Score {operator_risk}/100 - AVOID [-70 pts]')
+        elif operator_risk >= 30:
+            score -= 40
+            criteria.append(f'🚨 VERY HIGH RISK: Major manipulation signs (Risk: {operator_risk}/100) [-40 pts]')
+        elif operator_risk >= 20:
+            score -= 25
+            criteria.append(f'⚠️ HIGH RISK: Manipulation signs detected (Risk: {operator_risk}/100) [-25 pts]')
+        elif operator_risk >= 12:
+            score -= 12
+            criteria.append(f'⚠️ CAUTION: Some manipulation indicators (Risk: {operator_risk}/100) [-12 pts]')
+        
+        # 1. MARKET CAP QUALITY (15 pts) - NEW!
+        if market_cap >= 50000:
             score += 15
-            criteria.append(f'✅ Revenue: Good YoY Growth ({yoy_rev:.1f}%) [15 pts]')
-        elif yoy_rev >= 5:
-            score += 8
-            criteria.append(f'⚠ Revenue: Moderate Growth ({yoy_rev:.1f}%) [8 pts]')
-        else:
-            score += 0
-            criteria.append(f'❌ Revenue: Weak Growth ({yoy_rev:.1f}%) [0 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ Revenue: Data not available [0 pts]')
-    
-    # 3. PROFIT GROWTH (25 pts) - NEW! STRICTEST CRITERIA
-    yoy_profit = data['yoy_profit_growth']
-    qoq_profit = data['qoq_profit_growth']
-    profit_margin = data['profit_margin']
-    
-    if yoy_profit is not None and qoq_profit is not None:
-        if yoy_profit >= 30 and qoq_profit >= 20:
-            score += 25
-            criteria.append(f'✅ Profit: EXCEPTIONAL Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [25 pts]')
-        elif yoy_profit >= 25 and qoq_profit >= 15:
-            score += 22
-            criteria.append(f'✅ Profit: Excellent Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [22 pts]')
-        elif yoy_profit >= 20 and qoq_profit >= 10:
-            score += 18
-            criteria.append(f'✅ Profit: Strong Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [18 pts]')
-        elif yoy_profit >= 12 and qoq_profit >= 6:
+            criteria.append(f'✅ Market Cap: Large Cap (₹{market_cap:.0f} Cr) [15 pts]')
+        elif market_cap >= 20000:
             score += 12
-            criteria.append(f'⚠ Profit: Good Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [12 pts]')
-        elif yoy_profit >= 5:
-            score += 5
-            criteria.append(f'⚠ Profit: Moderate Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [5 pts]')
-        else:
-            score += 0
-            criteria.append(f'❌ Profit: Weak/Negative Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [0 pts]')
-    elif yoy_profit is not None:
-        if yoy_profit >= 25:
-            score += 20
-            criteria.append(f'✅ Profit: Strong YoY Growth ({yoy_profit:.1f}%) [20 pts]')
-        elif yoy_profit >= 15:
-            score += 15
-            criteria.append(f'✅ Profit: Good YoY Growth ({yoy_profit:.1f}%) [15 pts]')
-        elif yoy_profit >= 8:
-            score += 8
-            criteria.append(f'⚠ Profit: Moderate Growth ({yoy_profit:.1f}%) [8 pts]')
-        else:
-            score += 0
-            criteria.append(f'❌ Profit: Weak Growth ({yoy_profit:.1f}%) [0 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ Profit: Data not available [0 pts]')
-    
-    # 4. PROFIT MARGIN (15 pts) - NEW!
-    if profit_margin is not None:
-        profit_margin_pct = profit_margin * 100
-        if profit_margin_pct >= 20:
-            score += 15
-            criteria.append(f'✅ Profit Margin: Excellent ({profit_margin_pct:.1f}%) [15 pts]')
-        elif profit_margin_pct >= 15:
-            score += 12
-            criteria.append(f'✅ Profit Margin: Very Good ({profit_margin_pct:.1f}%) [12 pts]')
-        elif profit_margin_pct >= 10:
+            criteria.append(f'✅ Market Cap: Mid-Large Cap (₹{market_cap:.0f} Cr) [12 pts]')
+        elif market_cap >= 10000:
             score += 10
-            criteria.append(f'✅ Profit Margin: Good ({profit_margin_pct:.1f}%) [10 pts]')
-        elif profit_margin_pct >= 5:
-            score += 5
-            criteria.append(f'⚠ Profit Margin: Average ({profit_margin_pct:.1f}%) [5 pts]')
+            criteria.append(f'✅ Market Cap: Mid Cap (₹{market_cap:.0f} Cr) [10 pts]')
+        elif market_cap >= 5000:
+            score += 7
+            criteria.append(f'⚠ Market Cap: Small-Mid Cap (₹{market_cap:.0f} Cr) [7 pts]')
         else:
             score += 0
-            criteria.append(f'❌ Profit Margin: Low ({profit_margin_pct:.1f}%) [0 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ Profit Margin: Data not available [0 pts]')
-    
-    # 5. FII/DII ACTIVITY (20 pts)
-    fii_score = data['fii_dii_score']
-    if fii_score >= 15:
-        score += 20
-        criteria.append(f'✅ FII/DII: Strong Buying ({fii_score}) [20 pts]')
-    elif fii_score >= 10:
-        score += 15
-        criteria.append(f'✅ FII/DII: Good Buying ({fii_score}) [15 pts]')
-    elif fii_score >= 5:
-        score += 10
-        criteria.append(f'✅ FII/DII: Accumulation ({fii_score}) [10 pts]')
-    elif fii_score >= 0:
-        score += 5
-        criteria.append(f'⚠ FII/DII: Neutral ({fii_score}) [5 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ FII/DII: Selling ({fii_score}) [0 pts]')
-    
-    # 6. CONSOLIDATION (20 pts)
-    if -2 <= weekly_change <= 0.3:
-        score += 20
-        criteria.append(f'✅ Consolidation: Perfect base ({weekly_change:+.1f}% weekly) [20 pts]')
-    elif -3.5 <= weekly_change < -2:
-        score += 18
-        criteria.append(f'✅ Consolidation: Healthy pullback ({weekly_change:+.1f}% weekly) [18 pts]')
-    elif 0.3 < weekly_change <= 1.5:
-        score += 15
-        criteria.append(f'✅ Consolidation: Early breakout ({weekly_change:+.1f}% weekly) [15 pts]')
-    elif weekly_change > 4:
-        score += 0
-        criteria.append(f'❌ Already rallied ({weekly_change:+.1f}% weekly) [0 pts]')
-    else:
-        score += 5
-        criteria.append(f'⚠ Consolidation: Weak ({weekly_change:+.1f}% weekly) [5 pts]')
-    
-    # 7. RSI (20 pts)
-    if 32 <= rsi <= 38:
-        score += 20
-        criteria.append(f'✅ RSI: Perfect oversold entry ({rsi:.0f}) [20 pts]')
-    elif 38 < rsi <= 45:
-        score += 17
-        criteria.append(f'✅ RSI: Building momentum ({rsi:.0f}) [17 pts]')
-    elif 45 < rsi <= 50:
-        score += 12
-        criteria.append(f'✅ RSI: Early momentum ({rsi:.0f}) [12 pts]')
-    elif 50 < rsi <= 55:
-        score += 8
-        criteria.append(f'⚠ RSI: Neutral ({rsi:.0f}) [8 pts]')
-    elif rsi > 62:
-        score += 0
-        criteria.append(f'❌ RSI: Overbought ({rsi:.0f}) [0 pts]')
-    else:
-        score += 5
-        criteria.append(f'⚠ RSI: Moderate ({rsi:.0f}) [5 pts]')
-    
-    # 8. MACD (15 pts)
-    if -1 <= macd <= 1:
-        score += 15
-        criteria.append(f'✅ MACD: Perfect crossover ({macd:.1f}) [15 pts]')
-    elif 1 < macd <= 3:
-        score += 12
-        criteria.append(f'✅ MACD: Early bullish ({macd:.1f}) [12 pts]')
-    elif -3 <= macd < -1:
-        score += 10
-        criteria.append(f'✅ MACD: About to turn ({macd:.1f}) [10 pts]')
-    elif macd > 6:
-        score += 0
-        criteria.append(f'❌ MACD: Extended ({macd:.1f}) [0 pts]')
-    else:
-        score += 5
-        criteria.append(f'⚠ MACD: Weak ({macd:.1f}) [5 pts]')
-    
-    # 9. BOLLINGER BANDS (15 pts)
-    if 8 <= bb <= 20:
-        score += 15
-        criteria.append(f'✅ BB: Lower band bounce ({bb:.0f}%) [15 pts]')
-    elif 20 < bb <= 30:
-        score += 12
-        criteria.append(f'✅ BB: Below middle ({bb:.0f}%) [12 pts]')
-    elif 30 < bb <= 45:
-        score += 8
-        criteria.append(f'⚠ BB: Middle zone ({bb:.0f}%) [8 pts]')
-    elif bb > 65:
-        score += 0
-        criteria.append(f'❌ BB: Upper band ({bb:.0f}%) [0 pts]')
-    else:
-        score += 5
-        criteria.append(f'⚠ BB: Neutral ({bb:.0f}%) [5 pts]')
-    
-    # 10. VOLUME (15 pts)
-    if 1.3 <= vol <= 1.8:
-        score += 15
-        criteria.append(f'✅ Volume: Perfect accumulation ({vol:.1f}x) [15 pts]')
-    elif 1.8 < vol <= 2.2:
-        score += 12
-        criteria.append(f'✅ Volume: Building interest ({vol:.1f}x) [12 pts]')
-    elif vol > 2.8:
-        score += 5
-        criteria.append(f'⚠ Volume: Too high ({vol:.1f}x) [5 pts]')
-    elif 1.0 <= vol < 1.3:
-        score += 7
-        criteria.append(f'⚠ Volume: Average ({vol:.1f}x) [7 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ Volume: Too low ({vol:.1f}x) [0 pts]')
-    
-    # 11. TODAY'S PRICE (10 pts)
-    if -1.5 <= change <= 0.3:
-        score += 10
-        criteria.append(f'✅ Today: Perfect entry ({change:+.1f}%) [10 pts]')
-    elif 0.3 < change <= 1.2:
-        score += 8
-        criteria.append(f'✅ Today: Early move ({change:+.1f}%) [8 pts]')
-    elif -2.5 <= change < -1.5:
-        score += 7
-        criteria.append(f'⚠ Today: Dip ({change:+.1f}%) [7 pts]')
-    elif change > 2.5:
-        score += 0
-        criteria.append(f'❌ Today: Already rallied ({change:+.1f}%) [0 pts]')
-    else:
-        score += 4
-        criteria.append(f'⚠ Today: Moderate ({change:+.1f}%) [4 pts]')
-    
-    # 12. MONTHLY TREND (10 pts)
-    if -8 <= monthly_change <= -2:
-        score += 10
-        criteria.append(f'✅ Monthly: Recovering from dip ({monthly_change:+.1f}%) [10 pts]')
-    elif -2 < monthly_change <= 2:
-        score += 8
-        criteria.append(f'✅ Monthly: Base building ({monthly_change:+.1f}%) [8 pts]')
-    elif 2 < monthly_change <= 6:
-        score += 5
-        criteria.append(f'⚠ Monthly: Moderate gain ({monthly_change:+.1f}%) [5 pts]')
-    elif monthly_change > 10:
-        score += 0
-        criteria.append(f'❌ Monthly: Extended ({monthly_change:+.1f}%) [0 pts]')
-    else:
-        score += 3
-        criteria.append(f'⚠ Monthly: Weak ({monthly_change:+.1f}%) [3 pts]')
-    
-    # 13. 3-MONTH PERFORMANCE (10 pts)
-    if -15 <= three_month_change <= -5:
-        score += 10
-        criteria.append(f'✅ 3-Month: Perfect correction ({three_month_change:+.1f}%) [10 pts]')
-    elif -5 < three_month_change <= 5:
-        score += 8
-        criteria.append(f'✅ 3-Month: Sideways base ({three_month_change:+.1f}%) [8 pts]')
-    elif 5 < three_month_change <= 15:
-        score += 5
-        criteria.append(f'⚠ 3-Month: Moderate rise ({three_month_change:+.1f}%) [5 pts]')
-    elif three_month_change > 25:
-        score += 0
-        criteria.append(f'❌ 3-Month: Overextended ({three_month_change:+.1f}%) [0 pts]')
-    else:
-        score += 3
-        criteria.append(f'⚠ 3-Month: Weak ({three_month_change:+.1f}%) [3 pts]')
-    
-    # 14. UPSIDE POTENTIAL (10 pts)
-    if potential_pct >= 12:
-        score += 10
-        criteria.append(f'✅ Upside: Excellent ({potential_pct:.1f}%) [10 pts]')
-    elif potential_pct >= 10:
-        score += 8
-        criteria.append(f'✅ Upside: Very Good ({potential_pct:.1f}%) [8 pts]')
-    elif potential_pct >= 8:
-        score += 5
-        criteria.append(f'⚠ Upside: Good ({potential_pct:.1f}%) [5 pts]')
-    else:
-        score += 0
-        criteria.append(f'❌ Upside: Low ({potential_pct:.1f}%) [0 pts]')
-    
-    # Rating based on ULTRA-STRICT criteria
-    if is_operated:
-        status = '🚨 OPERATED - AVOID'
-        rating = 'Operated - Avoid'
-    elif score >= 180:
-        status = '🌟 EXCEPTIONAL BUY'
-        rating = 'Exceptional Buy'
-    elif score >= 160:
-        status = '🚀 PRIME BUY'
-        rating = 'Prime Buy'
-    elif score >= 140:
-        status = '💎 EXCELLENT BUY'
-        rating = 'Excellent Buy'
-    elif score >= 120:
-        status = '✅ STRONG BUY'
-        rating = 'Strong Buy'
-    elif score >= 100:
-        status = '👍 GOOD BUY'
-        rating = 'Good Buy'
-    elif score >= 80:
-        status = '📋 WATCHLIST'
-        rating = 'Watchlist'
-    else:
-        status = '❌ SKIP'
-        rating = 'Skip'
-    
-    qualified = score >= 140 and not is_operated
-    met_count = len([c for c in criteria if '✅' in c])
-    
-    return {
-        'symbol': data['symbol'],
-        'price': price,
-        'change': change,
-        'weekly_change': weekly_change,
-        'monthly_change': monthly_change,
-        'three_month_change': three_month_change,
-        'potential_rs': potential_rs,
-        'potential_pct': potential_pct,
-        'rsi': rsi,
-        'macd': macd,
-        'bb': bb,
-        'vol': vol,
-        'trend': trend,
-        'score': score,
-        'qualified': qualified,
-        'status': status,
-        'rating': rating,
-        'criteria': criteria,
-        'met_count': met_count,
-        'sector': SECTOR_MAP.get(data['symbol'], 'Other'),
-        'is_operated': is_operated,
-        'operator_risk': operator_risk,
-        'operator_flags': operator_flags,
-        'market_cap': market_cap,
-        'yoy_revenue_growth': yoy_rev,
-        'qoq_revenue_growth': qoq_rev,
-        'yoy_profit_growth': yoy_profit,
-        'qoq_profit_growth': qoq_profit,
-        'profit_margin': profit_margin * 100 if profit_margin else None,
-        'total_cash': data.get('total_cash', 0),
-        'latest_fy_revenue': data.get('latest_fy_revenue', 0),
-        'cash_on_hand_to_mcap': data.get('cash_on_hand_to_mcap', 0),
-        'latest_fy_revenue_to_mcap': data.get('latest_fy_revenue_to_mcap', 0),
-        'historical_data': data.get('historical_data', {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []})
-    }
+            criteria.append(f'❌ Market Cap: Small Cap (₹{market_cap:.0f} Cr) [0 pts]')
+        
+        # 2. REVENUE GROWTH (25 pts) - NEW! STRICTEST CRITERIA
+        yoy_rev = data['yoy_revenue_growth']
+        qoq_rev = data['qoq_revenue_growth']
+        
+        if yoy_rev is not None and qoq_rev is not None:
+            if yoy_rev >= 25 and qoq_rev >= 15:
+                score += 25
+                criteria.append(f'✅ Revenue: EXCEPTIONAL Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [25 pts]')
+            elif yoy_rev >= 20 and qoq_rev >= 10:
+                score += 22
+                criteria.append(f'✅ Revenue: Excellent Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [22 pts]')
+            elif yoy_rev >= 15 and qoq_rev >= 8:
+                score += 18
+                criteria.append(f'✅ Revenue: Strong Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [18 pts]')
+            elif yoy_rev >= 10 and qoq_rev >= 5:
+                score += 12
+                criteria.append(f'⚠ Revenue: Good Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [12 pts]')
+            elif yoy_rev >= 5:
+                score += 5
+                criteria.append(f'⚠ Revenue: Moderate Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [5 pts]')
+            else:
+                score += 0
+                criteria.append(f'❌ Revenue: Weak/Negative Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [0 pts]')
+        elif yoy_rev is not None:
+            if yoy_rev >= 20:
+                score += 20
+                criteria.append(f'✅ Revenue: Strong YoY Growth ({yoy_rev:.1f}%) [20 pts]')
+            elif yoy_rev >= 12:
+                score += 15
+                criteria.append(f'✅ Revenue: Good YoY Growth ({yoy_rev:.1f}%) [15 pts]')
+            elif yoy_rev >= 5:
+                score += 8
+                criteria.append(f'⚠ Revenue: Moderate Growth ({yoy_rev:.1f}%) [8 pts]')
+            else:
+                score += 0
+                criteria.append(f'❌ Revenue: Weak Growth ({yoy_rev:.1f}%) [0 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Revenue: Data not available [0 pts]')
+        
+        # 3. PROFIT GROWTH (25 pts) - NEW! STRICTEST CRITERIA
+        yoy_profit = data['yoy_profit_growth']
+        qoq_profit = data['qoq_profit_growth']
+        profit_margin = data['profit_margin']
+        
+        if yoy_profit is not None and qoq_profit is not None:
+            if yoy_profit >= 30 and qoq_profit >= 20:
+                score += 25
+                criteria.append(f'✅ Profit: EXCEPTIONAL Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [25 pts]')
+            elif yoy_profit >= 25 and qoq_profit >= 15:
+                score += 22
+                criteria.append(f'✅ Profit: Excellent Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [22 pts]')
+            elif yoy_profit >= 20 and qoq_profit >= 10:
+                score += 18
+                criteria.append(f'✅ Profit: Strong Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [18 pts]')
+            elif yoy_profit >= 12 and qoq_profit >= 6:
+                score += 12
+                criteria.append(f'⚠ Profit: Good Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [12 pts]')
+            elif yoy_profit >= 5:
+                score += 5
+                criteria.append(f'⚠ Profit: Moderate Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [5 pts]')
+            else:
+                score += 0
+                criteria.append(f'❌ Profit: Weak/Negative Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [0 pts]')
+        elif yoy_profit is not None:
+            if yoy_profit >= 25:
+                score += 20
+                criteria.append(f'✅ Profit: Strong YoY Growth ({yoy_profit:.1f}%) [20 pts]')
+            elif yoy_profit >= 15:
+                score += 15
+                criteria.append(f'✅ Profit: Good YoY Growth ({yoy_profit:.1f}%) [15 pts]')
+            elif yoy_profit >= 8:
+                score += 8
+                criteria.append(f'⚠ Profit: Moderate Growth ({yoy_profit:.1f}%) [8 pts]')
+            else:
+                score += 0
+                criteria.append(f'❌ Profit: Weak Growth ({yoy_profit:.1f}%) [0 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Profit: Data not available [0 pts]')
+        
+        # 4. PROFIT MARGIN (15 pts) - NEW!
+        if profit_margin is not None:
+            profit_margin_pct = profit_margin * 100
+            if profit_margin_pct >= 20:
+                score += 15
+                criteria.append(f'✅ Profit Margin: Excellent ({profit_margin_pct:.1f}%) [15 pts]')
+            elif profit_margin_pct >= 15:
+                score += 12
+                criteria.append(f'✅ Profit Margin: Very Good ({profit_margin_pct:.1f}%) [12 pts]')
+            elif profit_margin_pct >= 10:
+                score += 10
+                criteria.append(f'✅ Profit Margin: Good ({profit_margin_pct:.1f}%) [10 pts]')
+            elif profit_margin_pct >= 5:
+                score += 5
+                criteria.append(f'⚠ Profit Margin: Average ({profit_margin_pct:.1f}%) [5 pts]')
+            else:
+                score += 0
+                criteria.append(f'❌ Profit Margin: Low ({profit_margin_pct:.1f}%) [0 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Profit Margin: Data not available [0 pts]')
+        
+        # 5. FII/DII ACTIVITY (20 pts)
+        fii_score = data['fii_dii_score']
+        if fii_score >= 15:
+            score += 20
+            criteria.append(f'✅ FII/DII: Strong Buying ({fii_score}) [20 pts]')
+        elif fii_score >= 10:
+            score += 15
+            criteria.append(f'✅ FII/DII: Good Buying ({fii_score}) [15 pts]')
+        elif fii_score >= 5:
+            score += 10
+            criteria.append(f'✅ FII/DII: Accumulation ({fii_score}) [10 pts]')
+        elif fii_score >= 0:
+            score += 5
+            criteria.append(f'⚠ FII/DII: Neutral ({fii_score}) [5 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ FII/DII: Selling ({fii_score}) [0 pts]')
+        
+        # 6. CONSOLIDATION (20 pts)
+        if -2 <= weekly_change <= 0.3:
+            score += 20
+            criteria.append(f'✅ Consolidation: Perfect base ({weekly_change:+.1f}% weekly) [20 pts]')
+        elif -3.5 <= weekly_change < -2:
+            score += 18
+            criteria.append(f'✅ Consolidation: Healthy pullback ({weekly_change:+.1f}% weekly) [18 pts]')
+        elif 0.3 < weekly_change <= 1.5:
+            score += 15
+            criteria.append(f'✅ Consolidation: Early breakout ({weekly_change:+.1f}% weekly) [15 pts]')
+        elif weekly_change > 4:
+            score += 0
+            criteria.append(f'❌ Already rallied ({weekly_change:+.1f}% weekly) [0 pts]')
+        else:
+            score += 5
+            criteria.append(f'⚠ Consolidation: Weak ({weekly_change:+.1f}% weekly) [5 pts]')
+        
+        # 7. RSI (20 pts)
+        rsi_low = thresholds['rsi_low']
+        rsi_high = thresholds['rsi_high']
+        
+        if rsi_low <= rsi <= rsi_high:
+            score += 20
+            criteria.append(f'✅ RSI: Perfect oversold entry ({rsi:.0f}) [20 pts]')
+        elif rsi_high < rsi <= rsi_high + 7:
+            score += 17
+            criteria.append(f'✅ RSI: Building momentum ({rsi:.0f}) [17 pts]')
+        elif rsi_high + 7 < rsi <= rsi_high + 12:
+            score += 12
+            criteria.append(f'✅ RSI: Early momentum ({rsi:.0f}) [12 pts]')
+        elif rsi_high + 12 < rsi <= rsi_high + 17:
+            score += 8
+            criteria.append(f'⚠ RSI: Neutral ({rsi:.0f}) [8 pts]')
+        elif rsi > rsi_high + 24:
+            score += 0
+            criteria.append(f'❌ RSI: Overbought ({rsi:.0f}) [0 pts]')
+        else:
+            score += 5
+            criteria.append(f'⚠ RSI: Moderate ({rsi:.0f}) [5 pts]')
+        
+        # 8. MACD (15 pts)
+        if -1 <= macd <= 1:
+            score += 15
+            criteria.append(f'✅ MACD: Perfect crossover ({macd:.1f}) [15 pts]')
+        elif 1 < macd <= 3:
+            score += 12
+            criteria.append(f'✅ MACD: Early bullish ({macd:.1f}) [12 pts]')
+        elif -3 <= macd < -1:
+            score += 10
+            criteria.append(f'✅ MACD: About to turn ({macd:.1f}) [10 pts]')
+        elif macd > 6:
+            score += 0
+            criteria.append(f'❌ MACD: Extended ({macd:.1f}) [0 pts]')
+        else:
+            score += 5
+            criteria.append(f'⚠ MACD: Weak ({macd:.1f}) [5 pts]')
+        
+        # 9. BOLLINGER BANDS (15 pts)
+        if 8 <= bb <= 20:
+            score += 15
+            criteria.append(f'✅ BB: Lower band bounce ({bb:.0f}%) [15 pts]')
+        elif 20 < bb <= 30:
+            score += 12
+            criteria.append(f'✅ BB: Below middle ({bb:.0f}%) [12 pts]')
+        elif 30 < bb <= 45:
+            score += 8
+            criteria.append(f'⚠ BB: Middle zone ({bb:.0f}%) [8 pts]')
+        elif bb > 65:
+            score += 0
+            criteria.append(f'❌ BB: Upper band ({bb:.0f}%) [0 pts]')
+        else:
+            score += 5
+            criteria.append(f'⚠ BB: Neutral ({bb:.0f}%) [5 pts]')
+        
+        # 10. VOLUME (15 pts)
+        if 1.3 <= vol <= 1.8:
+            score += 15
+            criteria.append(f'✅ Volume: Perfect accumulation ({vol:.1f}x) [15 pts]')
+        elif 1.8 < vol <= 2.2:
+            score += 12
+            criteria.append(f'✅ Volume: Building interest ({vol:.1f}x) [12 pts]')
+        elif vol > 2.8:
+            score += 5
+            criteria.append(f'⚠ Volume: Too high ({vol:.1f}x) [5 pts]')
+        elif 1.0 <= vol < 1.3:
+            score += 7
+            criteria.append(f'⚠ Volume: Average ({vol:.1f}x) [7 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Volume: Too low ({vol:.1f}x) [0 pts]')
+        
+        # 11. TODAY'S PRICE (10 pts)
+        if -1.5 <= change <= 0.3:
+            score += 10
+            criteria.append(f'✅ Today: Perfect entry ({change:+.1f}%) [10 pts]')
+        elif 0.3 < change <= 1.2:
+            score += 8
+            criteria.append(f'✅ Today: Early move ({change:+.1f}%) [8 pts]')
+        elif -2.5 <= change < -1.5:
+            score += 7
+            criteria.append(f'⚠ Today: Dip ({change:+.1f}%) [7 pts]')
+        elif change > 2.5:
+            score += 0
+            criteria.append(f'❌ Today: Already rallied ({change:+.1f}%) [0 pts]')
+        else:
+            score += 4
+            criteria.append(f'⚠ Today: Moderate ({change:+.1f}%) [4 pts]')
+        
+        # 12. MONTHLY TREND (10 pts)
+        if -8 <= monthly_change <= -2:
+            score += 10
+            criteria.append(f'✅ Monthly: Recovering from dip ({monthly_change:+.1f}%) [10 pts]')
+        elif -2 < monthly_change <= 2:
+            score += 8
+            criteria.append(f'✅ Monthly: Base building ({monthly_change:+.1f}%) [8 pts]')
+        elif 2 < monthly_change <= 6:
+            score += 5
+            criteria.append(f'⚠ Monthly: Moderate gain ({monthly_change:+.1f}%) [5 pts]')
+        elif monthly_change > 10:
+            score += 0
+            criteria.append(f'❌ Monthly: Extended ({monthly_change:+.1f}%) [0 pts]')
+        else:
+            score += 3
+            criteria.append(f'⚠ Monthly: Weak ({monthly_change:+.1f}%) [3 pts]')
+        
+        # 13. 3-MONTH PERFORMANCE (10 pts)
+        if -15 <= three_month_change <= -5:
+            score += 10
+            criteria.append(f'✅ 3-Month: Perfect correction ({three_month_change:+.1f}%) [10 pts]')
+        elif -5 < three_month_change <= 5:
+            score += 8
+            criteria.append(f'✅ 3-Month: Sideways base ({three_month_change:+.1f}%) [8 pts]')
+        elif 5 < three_month_change <= 15:
+            score += 5
+            criteria.append(f'⚠ 3-Month: Moderate rise ({three_month_change:+.1f}%) [5 pts]')
+        elif three_month_change > 25:
+            score += 0
+            criteria.append(f'❌ 3-Month: Overextended ({three_month_change:+.1f}%) [0 pts]')
+        else:
+            score += 3
+            criteria.append(f'⚠ 3-Month: Weak ({three_month_change:+.1f}%) [3 pts]')
+        
+        # 14. UPSIDE POTENTIAL (10 pts)
+        if potential_pct >= 12:
+            score += 10
+            criteria.append(f'✅ Upside: Excellent ({potential_pct:.1f}%) [10 pts]')
+        elif potential_pct >= 10:
+            score += 8
+            criteria.append(f'✅ Upside: Very Good ({potential_pct:.1f}%) [8 pts]')
+        elif potential_pct >= 8:
+            score += 5
+            criteria.append(f'⚠ Upside: Good ({potential_pct:.1f}%) [5 pts]')
+        else:
+            score += 0
+            criteria.append(f'❌ Upside: Low ({potential_pct:.1f}%) [0 pts]')
+        
+        # Rating based on ULTRA-STRICT criteria with ADJUSTABLE thresholds
+        threshold_exceptional = thresholds['threshold_exceptional']
+        threshold_prime = thresholds['threshold_prime']
+        threshold_excellent = thresholds['threshold_excellent']
+        threshold_strong = thresholds['threshold_strong']
+        
+        if is_operated:
+            status = '🚨 OPERATED - AVOID'
+            rating = 'Operated - Avoid'
+        elif score >= threshold_exceptional:
+            status = '🌟 EXCEPTIONAL BUY'
+            rating = 'Exceptional Buy'
+        elif score >= threshold_prime:
+            status = '🚀 PRIME BUY'
+            rating = 'Prime Buy'
+        elif score >= threshold_excellent:
+            status = '💎 EXCELLENT BUY'
+            rating = 'Excellent Buy'
+        elif score >= threshold_strong:
+            status = '✅ STRONG BUY'
+            rating = 'Strong Buy'
+        elif score >= 100:
+            status = '👍 GOOD BUY'
+            rating = 'Good Buy'
+        elif score >= 80:
+            status = '📋 WATCHLIST'
+            rating = 'Watchlist'
+        else:
+            status = '❌ SKIP'
+            rating = 'Skip'
+        
+        qualified = score >= threshold_excellent and not is_operated
+        met_count = len([c for c in criteria if '✅' in c])
+        
+        return {
+            'symbol': data['symbol'],
+            'price': price,
+            'change': change,
+            'weekly_change': weekly_change,
+            'monthly_change': monthly_change,
+            'three_month_change': three_month_change,
+            'potential_rs': potential_rs,
+            'potential_pct': potential_pct,
+            'rsi': rsi,
+            'macd': macd,
+            'bb': bb,
+            'vol': vol,
+            'trend': trend,
+            'score': score,
+            'qualified': qualified,
+            'status': status,
+            'rating': rating,
+            'criteria': criteria,
+            'met_count': met_count,
+            'sector': SECTOR_MAP.get(data['symbol'], 'Other'),
+            'is_operated': is_operated,
+            'operator_risk': operator_risk,
+            'operator_flags': operator_flags,
+            'market_cap': market_cap,
+            'yoy_revenue_growth': yoy_rev,
+            'qoq_revenue_growth': qoq_rev,
+            'yoy_profit_growth': yoy_profit,
+            'qoq_profit_growth': qoq_profit,
+            'profit_margin': profit_margin * 100 if profit_margin else None,
+            'total_cash': data.get('total_cash', 0),
+            'latest_fy_revenue': data.get('latest_fy_revenue', 0),
+            'cash_on_hand_to_mcap': data.get('cash_on_hand_to_mcap', 0),
+            'latest_fy_revenue_to_mcap': data.get('latest_fy_revenue_to_mcap', 0),
+            'historical_data': data.get('historical_data', {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []})
+        }
+    except Exception as e:
+        # Silently return None on error
+        return None
 
 # Main App
-st.markdown('<p class="main-header">🎯 Indian Stock Scout - ULTRA-STRICT with Fundamentals</p>', unsafe_allow_html=True)
-st.markdown("*Only stocks with EXCEPTIONAL fundamentals + technicals qualify*")
+st.markdown('<p class="main-header">🎯 Indian Stock Scout - NSE & BSE Ultra-Strict Scanner</p>', unsafe_allow_html=True)
+st.markdown("*Choose NSE, BSE, or BOTH | Only stocks with EXCEPTIONAL fundamentals + technicals qualify*")
+
+# Show exchange summary prominently
+if 'AVAILABLE_STOCKS' in locals() and len(AVAILABLE_STOCKS) > 0:
+    if scan_nse and scan_bse:
+        banner_text = f"📈 Scanning BOTH Exchanges: NSE ({NSE_COUNT}) + BSE ({BSE_COUNT}) = {len(AVAILABLE_STOCKS)} Total"
+        banner_color = "linear-gradient(90deg, #1f77b4 0%, #1f77b4 50%, #ff7f0e 50%, #ff7f0e 100%)"
+    elif scan_nse:
+        banner_text = f"📈 Scanning NSE Only: {NSE_COUNT} stocks loaded"
+        banner_color = "#1f77b4"
+    else:
+        banner_text = f"📈 Scanning BSE Only: {BSE_COUNT} stocks loaded"
+        banner_color = "#ff7f0e"
+    
+    st.markdown(f"""
+    <div style='text-align:center;background: {banner_color};padding:0.8rem;border-radius:8px;margin:1rem 0;'>
+    <p style='color:white;font-size:1.2rem;font-weight:bold;margin:0;'>
+    {banner_text}
+    </p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Sidebar
 st.sidebar.header("⚙ Scanner Configuration")
 
+# Exchange selection with checkboxes
+st.sidebar.subheader("📈 Select Exchanges to Scan")
+scan_nse = st.sidebar.checkbox("✅ Scan NSE Stocks", value=True, help="Loads stocks from nse.txt and adds .NS suffix")
+scan_bse = st.sidebar.checkbox("✅ Scan BSE Stocks", value=True, help="Loads stocks from bse.txt and adds .BO suffix")
+
+if not scan_nse and not scan_bse:
+    st.sidebar.error("⚠️ Please select at least one exchange!")
+    AVAILABLE_STOCKS = []
+    NSE_COUNT = 0
+    BSE_COUNT = 0
+else:
+    # Load stocks based on selection - SIMPLE LOGIC
+    AVAILABLE_STOCKS = []
+    NSE_COUNT = 0
+    BSE_COUNT = 0
+    
+    if scan_nse:
+        try:
+            with open('nse.txt', 'r') as f:
+                # Just load the stock names (like RELIANCE, TCS, etc.)
+                nse_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
+            
+            if nse_stocks:
+                # Add .NS suffix to each
+                for stock in nse_stocks:
+                    AVAILABLE_STOCKS.append(f"{stock}.NS")
+                NSE_COUNT = len(nse_stocks)
+        except FileNotFoundError:
+            st.sidebar.warning("⚠️ nse.txt not found")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error loading nse.txt: {str(e)}")
+    
+    if scan_bse:
+        try:
+            with open('bse.txt', 'r') as f:
+                # Just load the stock names (like RELIANCE, TCS, etc.)
+                bse_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
+            
+            if bse_stocks:
+                # Add .BO suffix to each
+                for stock in bse_stocks:
+                    AVAILABLE_STOCKS.append(f"{stock}.BO")
+                BSE_COUNT = len(bse_stocks)
+        except FileNotFoundError:
+            st.sidebar.warning("⚠️ bse.txt not found")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error loading bse.txt: {str(e)}")
+    
+    # Remove duplicates if any
+    AVAILABLE_STOCKS = list(dict.fromkeys(AVAILABLE_STOCKS))
+    
+    if AVAILABLE_STOCKS:
+        exchange_text = []
+        if scan_nse:
+            exchange_text.append(f"NSE: {NSE_COUNT}")
+        if scan_bse:
+            exchange_text.append(f"BSE: {BSE_COUNT}")
+        
+        st.sidebar.success(f"✅ Loaded {len(AVAILABLE_STOCKS)} stocks\n" + " | ".join(exchange_text))
+    else:
+        st.sidebar.error("❌ No stocks loaded")
+
+st.sidebar.markdown("---")
+
 scan_mode = st.sidebar.radio("Scan Mode", 
-    ["Quick Scan (50 stocks)", "Full Scan (2000+ stocks)", "Custom List"])
+    ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Custom List"])
 
 if scan_mode == "Quick Scan (50 stocks)":
-    stocks_to_scan = NSE_STOCKS[:50]
-elif scan_mode == "Full Scan (2000+ stocks)":
-    stocks_to_scan = NSE_STOCKS
+    stocks_to_scan = AVAILABLE_STOCKS[:50]
+elif scan_mode == "Full Scan (All stocks)":
+    stocks_to_scan = AVAILABLE_STOCKS
 else:
-    custom_input = st.sidebar.text_area("Enter NSE symbols (one per line)", 
-        'WITHOUT ".NS"', height=150)
-    stocks_to_scan = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
+    custom_input = st.sidebar.text_area("Enter symbols (one per line)", 
+        'Stock names with exchange suffix:\nRELIANCE.NS\nTCS.BO\nINFY.NS\n\nOr without (defaults to NSE):\nRELIANCE\nTCS', height=150)
+    raw_symbols = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
+    stocks_to_scan = []
+    for symbol in raw_symbols:
+        if '.NS' in symbol or '.BO' in symbol:
+            stocks_to_scan.append(symbol)
+        else:
+            # Default to NSE if no exchange specified
+            stocks_to_scan.append(f"{symbol}.NS")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚡ Performance Settings")
+
+# Parallel processing settings
+use_parallel = st.sidebar.checkbox("🚀 Enable Parallel Processing", value=False,
+    help="Process multiple stocks simultaneously (faster but uses more resources)")
+
+if use_parallel:
+    max_workers = st.sidebar.slider("Parallel Workers", 1, 10, 5, 1,
+        help="Number of stocks to process at the same time. Higher = faster but needs more memory.")
+    request_delay = st.sidebar.slider("Request Delay (sec)", 0.1, 2.0, 0.5, 0.1,
+        help="Delay between API requests to avoid rate limiting")
+    
+    st.sidebar.info("""
+    **ℹ️ How Parallel Processing Works:**
+    
+    With 5 workers, scanner processes 5 stocks simultaneously instead of one-by-one.
+    
+    Example: 100 stocks
+    - Sequential: 100 × 0.5s = 50 seconds
+    - Parallel (5 workers): 100 ÷ 5 × 0.5s = 10 seconds
+    
+    **Each stock is scanned only ONCE!**
+    """)
+else:
+    max_workers = 1
+    request_delay = 0.2
+    
+    st.sidebar.info("""
+    **ℹ️ Sequential Processing (Safer):**
+    
+    Processes one stock at a time.
+    Slower but safest for avoiding rate limits.
+    """)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("💰 Market Cap Filter")
 min_market_cap = st.sidebar.slider("Minimum Market Cap (₹ Crores)", 
     0, 100000, 5000, 1000,
     help="Filter stocks by minimum market capitalization")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 Adjustable Scoring Thresholds")
+
+with st.sidebar.expander("📊 Customize Score Thresholds", expanded=False):
+    st.markdown("**Qualification Scores:**")
+    threshold_exceptional = st.number_input("Exceptional (≥)", 100, 250, 180, 10)
+    threshold_prime = st.number_input("Prime (≥)", 100, 250, 160, 10)
+    threshold_excellent = st.number_input("Excellent (≥)", 100, 250, 140, 10)
+    threshold_strong = st.number_input("Strong (≥)", 50, 200, 120, 10)
+    
+    st.markdown("**Technical Thresholds:**")
+    rsi_low = st.number_input("RSI Lower Bound", 20, 50, 32, 1)
+    rsi_high = st.number_input("RSI Upper Bound", 30, 60, 38, 1)
+    
+    st.markdown("**Growth Thresholds:**")
+    min_revenue_yoy = st.number_input("Min Revenue YoY %", 0, 50, 20, 5)
+    min_profit_yoy = st.number_input("Min Profit YoY %", 0, 50, 25, 5)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 ULTRA-STRICT Criteria")
@@ -919,35 +1131,167 @@ if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_contain
     failed = 0
     filtered_out = 0
     
-    for idx, symbol in enumerate(stocks_to_scan):
-        status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
+    # BULLETPROOF: Add delay tracking to avoid rate limiting
+    start_time = time.time()
+    last_request_time = time.time()
+    
+    if use_parallel and max_workers > 1:
+        # PARALLEL PROCESSING MODE
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        data = fetch_stock_data(symbol)
-        if data:
-            analysis = analyze_stock(data, min_market_cap)
-            if analysis:
-                results.append(analysis)
-            else:
-                filtered_out += 1
-        else:
-            failed += 1
+        st.info(f"🚀 Parallel processing enabled: {max_workers} workers processing {total} stocks...")
         
-        progress = (idx + 1) / total
-        progress_bar.progress(progress)
-        
-        if (idx + 1) % 10 == 0 or idx == total - 1:
-            valid_results_count = len([r for r in results if r is not None])
-            qualified_count = len([r for r in results if r is not None and r['qualified']])
-            stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥140): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
-        
-        time.sleep(0.2)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all stocks at once
+            future_to_stock = {executor.submit(fetch_stock_data, stock): stock for stock in stocks_to_scan}
+            
+            for future in as_completed(future_to_stock):
+                stock = future_to_stock[future]
+                try:
+                    data = future.result()
+                    if data:
+                        analysis = analyze_stock(data, min_market_cap, {
+                            'threshold_exceptional': threshold_exceptional,
+                            'threshold_prime': threshold_prime,
+                            'threshold_excellent': threshold_excellent,
+                            'threshold_strong': threshold_strong,
+                            'rsi_low': rsi_low,
+                            'rsi_high': rsi_high,
+                            'min_revenue_yoy': min_revenue_yoy,
+                            'min_profit_yoy': min_profit_yoy
+                        })
+                        if analysis:
+                            results.append(analysis)
+                        else:
+                            filtered_out += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    failed += 1
+                
+                # Update progress
+                current = len(results) + failed + filtered_out
+                progress_bar.progress(min(current / total, 1.0))
+                
+                # Check if stock symbol changed (fallback was used)
+                stock_display = stock
+                if data and data.get('symbol') != stock:
+                    stock_display = f"{stock} → {data['symbol']}"
+                
+                if current % 10 == 0 or current == total:
+                    valid_results_count = len([r for r in results if r is not None])
+                    qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
+                    status_text.info(f"📊 Processing {stock_display}... ({current}/{total})")
+                    stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
+                
+                # Small delay to avoid rate limiting
+                time.sleep(request_delay / max_workers)
+    
+    else:
+        # SEQUENTIAL PROCESSING MODE (original)
+        for idx, symbol in enumerate(stocks_to_scan):
+            # BULLETPROOF: Rate limiting - ensure minimum delay between requests
+            elapsed = time.time() - last_request_time
+            if elapsed < request_delay:
+                time.sleep(request_delay - elapsed)
+            
+            status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
+            
+            # BULLETPROOF: Wrap fetch in try-catch
+            try:
+                data = fetch_stock_data(symbol)
+                if data:
+                    analysis = analyze_stock(data, min_market_cap, {
+                        'threshold_exceptional': threshold_exceptional,
+                        'threshold_prime': threshold_prime,
+                        'threshold_excellent': threshold_excellent,
+                        'threshold_strong': threshold_strong,
+                        'rsi_low': rsi_low,
+                        'rsi_high': rsi_high,
+                        'min_revenue_yoy': min_revenue_yoy,
+                        'min_profit_yoy': min_profit_yoy
+                    })
+                    if analysis:
+                        results.append(analysis)
+                    else:
+                        filtered_out += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+            
+            last_request_time = time.time()
+            
+            progress = (idx + 1) / total
+            progress_bar.progress(progress)
+            
+            if (idx + 1) % 10 == 0 or idx == total - 1:
+                valid_results_count = len([r for r in results if r is not None])
+                qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
+                stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
+            
+            # BULLETPROOF: Reduced sleep time since we have rate limiting above
+            time.sleep(0.1)
     
     # Filter out None results before storing
     results = [r for r in results if r is not None]
     st.session_state.scan_results = results
     st.session_state.scan_timestamp = datetime.now()
+    st.session_state.failed_tickers = [stocks_to_scan[i] for i in range(len(stocks_to_scan)) if i >= len(results) + filtered_out][:failed]
     
-    status_text.success(f"✅ Scan complete! Found {len(results)} stocks meeting market cap criteria")
+    # Save thresholds to session state
+    st.session_state.threshold_exceptional = threshold_exceptional
+    st.session_state.threshold_prime = threshold_prime
+    st.session_state.threshold_excellent = threshold_excellent
+    st.session_state.threshold_strong = threshold_strong
+    
+    elapsed_time = (time.time() - start_time) / 60  # Convert to minutes
+    
+    # Show completion stats
+    st.success(f"✅ Scan complete! Found {len(results)} stocks meeting market cap criteria")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("✅ Successfully Processed", len(results))
+    col2.metric("❌ Failed", failed)
+    col3.metric("🚫 Filtered Out", filtered_out)
+    col4.metric("⏱️ Time Taken", f"{elapsed_time:.1f} min")
+    
+    # Show failed tickers with retry option
+    if failed > 0 and 'failed_tickers' in st.session_state and st.session_state.failed_tickers:
+        with st.expander(f"⚠️ Failed Tickers ({failed})", expanded=False):
+            st.write(", ".join(st.session_state.failed_tickers[:20]))  # Show first 20
+            if len(st.session_state.failed_tickers) > 20:
+                st.caption(f"...and {len(st.session_state.failed_tickers) - 20} more")
+            
+            if st.button("🔄 Retry Failed Tickers"):
+                with st.spinner("Retrying failed tickers..."):
+                    retry_results = []
+                    for ticker in st.session_state.failed_tickers:
+                        try:
+                            data = bulletproof_fetch(fetch_stock_data, ticker, max_retries=5)
+                            if data:
+                                analysis = analyze_stock(data, min_market_cap, {
+                                    'threshold_exceptional': threshold_exceptional,
+                                    'threshold_prime': threshold_prime,
+                                    'threshold_excellent': threshold_excellent,
+                                    'threshold_strong': threshold_strong,
+                                    'rsi_low': rsi_low,
+                                    'rsi_high': rsi_high,
+                                    'min_revenue_yoy': min_revenue_yoy,
+                                    'min_profit_yoy': min_profit_yoy
+                                })
+                                if analysis:
+                                    retry_results.append(analysis)
+                        except:
+                            pass
+                    
+                    if retry_results:
+                        st.session_state.scan_results.extend(retry_results)
+                        st.success(f"✅ Recovered {len(retry_results)} additional stocks!")
+                        time.sleep(1)
+                    else:
+                        st.warning("No additional stocks recovered")
+    
     time.sleep(1)
     status_text.empty()
     stats_placeholder.empty()
@@ -1000,12 +1344,16 @@ if st.session_state.scan_results:
             with st.spinner("🔄 Refreshing live prices..."):
                 updated_count = 0
                 for result in results:
-                    new_price = fetch_live_price(result['symbol'])
-                    if new_price and new_price != result['price']:
-                        prev_price = result['price']
-                        result['price'] = new_price
-                        result['change'] = ((new_price - prev_price) / prev_price) * 100
-                        updated_count += 1
+                    # BULLETPROOF: Wrap in try-catch
+                    try:
+                        new_price = fetch_live_price(result['symbol'])
+                        if new_price and new_price != result['price']:
+                            prev_price = result['price']
+                            result['price'] = new_price
+                            result['change'] = ((new_price - prev_price) / prev_price) * 100 if prev_price != 0 else 0
+                            updated_count += 1
+                    except:
+                        pass
                 
                 st.session_state.last_refresh = datetime.now()
                 st.session_state.refresh_counter += 1
@@ -1023,16 +1371,17 @@ if st.session_state.scan_results:
             time.sleep(5)  # Check every 5 seconds
             st.rerun()
     
-    # Convert to DataFrame
+    # Convert to DataFrame - BULLETPROOF: Safe conversions
     df = pd.DataFrame([{
         'Symbol': r['symbol'],
+        'Exchange': 'NSE' if '.NS' in r['symbol'] else 'BSE' if '.BO' in r['symbol'] else 'N/A',
         'Price (₹)': r['price'],
         'Today (%)': r['change'],
         'Weekly (%)': r['weekly_change'],
         'Monthly (%)': r['monthly_change'],
         '3M (%)': r['three_month_change'],
         'Market Cap (₹Cr)': r['market_cap'],
-        'Cash/Hand (₹Cr)': r.get('total_cash', 0) / 10000000,
+        'Cash/Hand (₹Cr)': r.get('total_cash', 0) / 10000000 if r.get('total_cash') else 0,
         'CashHand/MCap (%)': r.get('cash_on_hand_to_mcap', 0),
         'LatestFY Rev/MCap': r.get('latest_fy_revenue_to_mcap', 0),
         'Rev YoY (%)': r['yoy_revenue_growth'],
@@ -1055,19 +1404,35 @@ if st.session_state.scan_results:
     # Statistics
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     
+    # Get thresholds from session or use defaults
+    threshold_exceptional = st.session_state.get('threshold_exceptional', 180)
+    threshold_prime = st.session_state.get('threshold_prime', 160)
+    threshold_excellent = st.session_state.get('threshold_excellent', 140)
+    threshold_strong = st.session_state.get('threshold_strong', 120)
+    
     operated_stocks = df[df['Operated'] == '🚨 YES']
     safe_stocks = df[df['Operated'] == '✅ Safe']
-    exceptional = df[(df['Score'] >= 180) & (df['Operated'] == '✅ Safe')]
-    prime = df[(df['Score'] >= 160) & (df['Score'] < 180) & (df['Operated'] == '✅ Safe')]
-    excellent = df[(df['Score'] >= 140) & (df['Score'] < 160) & (df['Operated'] == '✅ Safe')]
-    strong = df[(df['Score'] >= 120) & (df['Score'] < 140) & (df['Operated'] == '✅ Safe')]
+    exceptional = df[(df['Score'] >= threshold_exceptional) & (df['Operated'] == '✅ Safe')]
+    prime = df[(df['Score'] >= threshold_prime) & (df['Score'] < threshold_exceptional) & (df['Operated'] == '✅ Safe')]
+    excellent = df[(df['Score'] >= threshold_excellent) & (df['Score'] < threshold_prime) & (df['Operated'] == '✅ Safe')]
+    strong = df[(df['Score'] >= threshold_strong) & (df['Score'] < threshold_excellent) & (df['Operated'] == '✅ Safe')]
     
     col1.metric("Total Scanned", len(df))
     col2.metric("🚨 Operated", len(operated_stocks))
-    col3.metric("🌟 Exceptional (≥180)", len(exceptional))
-    col4.metric("🚀 Prime (160-179)", len(prime))
-    col5.metric("💎 Excellent (140-159)", len(excellent))
-    col6.metric("✅ Strong (120-139)", len(strong))
+    col3.metric(f"🌟 Exceptional (≥{threshold_exceptional})", len(exceptional))
+    col4.metric(f"🚀 Prime ({threshold_prime}-{threshold_exceptional-1})", len(prime))
+    col5.metric(f"💎 Excellent ({threshold_excellent}-{threshold_prime-1})", len(excellent))
+    col6.metric(f"✅ Strong ({threshold_strong}-{threshold_excellent-1})", len(strong))
+    
+    # Exchange breakdown
+    st.markdown("---")
+    exchange_col1, exchange_col2, exchange_col3 = st.columns(3)
+    nse_stocks = df[df['Exchange'] == 'NSE']
+    bse_stocks = df[df['Exchange'] == 'BSE']
+    
+    exchange_col1.metric("📊 NSE Stocks", len(nse_stocks))
+    exchange_col2.metric("📊 BSE Stocks", len(bse_stocks))
+    exchange_col3.metric("🎯 Qualified (≥140)", len(exceptional) + len(prime) + len(excellent))
     
     # Qualification summary
     qualified_total = len(exceptional) + len(prime) + len(excellent)
@@ -1081,21 +1446,25 @@ if st.session_state.scan_results:
     # Filtering
     st.subheader("🔍 Filter Results")
     
-    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(5)
     
     with filter_col1:
         rating_filter = st.selectbox("Rating", 
             ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip"])
     
     with filter_col2:
+        exchange_filter = st.selectbox("Exchange",
+            ["All", "NSE", "BSE"])
+    
+    with filter_col3:
         safety_filter = st.selectbox("Safety", 
             ["All", "✅ Safe Only", "🚨 Operated Only"])
     
-    with filter_col3:
+    with filter_col4:
         sector_filter = st.selectbox("Sector", 
             ["All"] + sorted(df['Sector'].unique().tolist()))
     
-    with filter_col4:
+    with filter_col5:
         min_score_filter = st.number_input("Min Score", 0, 250, 140, 10,
                                           help="Default: 140 (Qualified)")
     
@@ -1104,6 +1473,9 @@ if st.session_state.scan_results:
     
     if rating_filter != "All":
         filtered_df = filtered_df[filtered_df['Rating'] == rating_filter]
+    
+    if exchange_filter != "All":
+        filtered_df = filtered_df[filtered_df['Exchange'] == exchange_filter]
     
     if safety_filter == "✅ Safe Only":
         filtered_df = filtered_df[filtered_df['Operated'] == '✅ Safe']
@@ -1373,7 +1745,7 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center;color:#666;'>
-<p><strong>Ultra-Strict Scanner with Fundamentals</strong> | Top 1-3% Only</p>
+<p><strong>NSE & BSE Ultra-Strict Scanner with Fundamentals</strong> | Top 1-3% Only</p>
 <p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice.</p>
 </div>
 """, unsafe_allow_html=True)
