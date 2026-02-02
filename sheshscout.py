@@ -996,12 +996,68 @@ else:
 st.sidebar.markdown("---")
 
 scan_mode = st.sidebar.radio("Scan Mode", 
-    ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Custom List"])
+    ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Slot-wise Scan", "Custom List"])
 
 if scan_mode == "Quick Scan (50 stocks)":
     stocks_to_scan = AVAILABLE_STOCKS[:50]
 elif scan_mode == "Full Scan (All stocks)":
     stocks_to_scan = AVAILABLE_STOCKS
+elif scan_mode == "Slot-wise Scan":
+    st.sidebar.subheader("📦 Select Slots to Scan")
+    
+    total_stocks = len(AVAILABLE_STOCKS)
+    slot_size = 1000
+    num_slots = (total_stocks + slot_size - 1) // slot_size  # Ceiling division
+    
+    st.sidebar.info(f"📊 Total stocks: {total_stocks}\n💼 Slot size: 1000 stocks\n📦 Total slots: {num_slots}")
+    
+    # Helper buttons for quick selection
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        if st.button("✅ Select All", use_container_width=True):
+            for slot_num in range(num_slots):
+                st.session_state[f"slot_{slot_num}"] = True
+            st.rerun()
+    with col2:
+        if st.button("❌ Deselect All", use_container_width=True):
+            for slot_num in range(num_slots):
+                st.session_state[f"slot_{slot_num}"] = False
+            st.rerun()
+    
+    st.sidebar.markdown("---")
+    
+    # Create checkboxes for each slot with exchange breakdown
+    selected_slots = []
+    for slot_num in range(num_slots):
+        start_idx = slot_num * slot_size
+        end_idx = min((slot_num + 1) * slot_size, total_stocks)
+        slot_stocks = AVAILABLE_STOCKS[start_idx:end_idx]
+        slot_count = len(slot_stocks)
+        
+        # Count NSE and BSE in this slot
+        nse_in_slot = sum(1 for s in slot_stocks if '.NS' in s)
+        bse_in_slot = sum(1 for s in slot_stocks if '.BO' in s)
+        
+        slot_label = f"Slot {slot_num + 1}: {start_idx + 1}-{end_idx}"
+        slot_detail = f"({slot_count}: {nse_in_slot} NSE, {bse_in_slot} BSE)"
+        
+        if st.sidebar.checkbox(f"{slot_label} {slot_detail}", key=f"slot_{slot_num}"):
+            selected_slots.append(slot_num)
+    
+    # Build stocks list from selected slots
+    stocks_to_scan = []
+    for slot_num in selected_slots:
+        start_idx = slot_num * slot_size
+        end_idx = min((slot_num + 1) * slot_size, total_stocks)
+        stocks_to_scan.extend(AVAILABLE_STOCKS[start_idx:end_idx])
+    
+    if not selected_slots:
+        st.sidebar.warning("⚠️ Please select at least one slot to scan")
+        stocks_to_scan = []
+    else:
+        nse_selected = sum(1 for s in stocks_to_scan if '.NS' in s)
+        bse_selected = sum(1 for s in stocks_to_scan if '.BO' in s)
+        st.sidebar.success(f"✅ {len(selected_slots)} slot(s) selected\n📊 Total: {len(stocks_to_scan)} stocks\n🔵 NSE: {nse_selected} | 🟠 BSE: {bse_selected}")
 else:
     custom_input = st.sidebar.text_area("Enter symbols (one per line)", 
         'Stock names with exchange suffix:\nRELIANCE.NS\nTCS.BO\nINFY.NS\n\nOr without (defaults to NSE):\nRELIANCE\nTCS', height=150)
@@ -1015,39 +1071,22 @@ else:
             stocks_to_scan.append(f"{symbol}.NS")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("⚡ Performance Settings")
+st.sidebar.subheader("⚡ Scanning Speed")
 
-# Parallel processing settings
-use_parallel = st.sidebar.checkbox("🚀 Enable Parallel Processing", value=False,
-    help="Process multiple stocks simultaneously (faster but uses more resources)")
+request_delay = st.sidebar.slider("Delay between requests (sec)", 0.1, 2.0, 0.3, 0.1,
+    help="Delay between each stock scan. Higher = slower but better success rate. Lower = faster but may get rate limited.")
 
-if use_parallel:
-    max_workers = st.sidebar.slider("Parallel Workers", 1, 10, 5, 1,
-        help="Number of stocks to process at the same time. Higher = faster but needs more memory.")
-    request_delay = st.sidebar.slider("Request Delay (sec)", 0.1, 2.0, 0.5, 0.1,
-        help="Delay between API requests to avoid rate limiting")
-    
-    st.sidebar.info("""
-    **ℹ️ How Parallel Processing Works:**
-    
-    With 5 workers, scanner processes 5 stocks simultaneously instead of one-by-one.
-    
-    Example: 100 stocks
-    - Sequential: 100 × 0.5s = 50 seconds
-    - Parallel (5 workers): 100 ÷ 5 × 0.5s = 10 seconds
-    
-    **Each stock is scanned only ONCE!**
-    """)
-else:
-    max_workers = 1
-    request_delay = 0.2
-    
-    st.sidebar.info("""
-    **ℹ️ Sequential Processing (Safer):**
-    
-    Processes one stock at a time.
-    Slower but safest for avoiding rate limits.
-    """)
+st.sidebar.info("""
+**ℹ️ Sequential Processing (Best Quality):**
+
+Scans one stock at a time with delays.
+- More reliable
+- Better success rate  
+- No rate limiting issues
+- Recommended: 0.3 seconds
+
+**Note:** Parallel processing removed because it causes Yahoo Finance to block requests, resulting in failed tickers.
+""")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("💰 Market Cap Filter")
@@ -1131,107 +1170,44 @@ if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_contain
     failed = 0
     filtered_out = 0
     
-    # BULLETPROOF: Add delay tracking to avoid rate limiting
     start_time = time.time()
-    last_request_time = time.time()
     
-    if use_parallel and max_workers > 1:
-        # PARALLEL PROCESSING MODE
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    # SEQUENTIAL PROCESSING ONLY (Best Quality - No Rate Limiting Issues)
+    for idx, symbol in enumerate(stocks_to_scan):
+        status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
         
-        st.info(f"🚀 Parallel processing enabled: {max_workers} workers processing {total} stocks...")
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all stocks at once
-            future_to_stock = {executor.submit(fetch_stock_data, stock): stock for stock in stocks_to_scan}
-            
-            for future in as_completed(future_to_stock):
-                stock = future_to_stock[future]
-                try:
-                    data = future.result()
-                    if data:
-                        analysis = analyze_stock(data, min_market_cap, {
-                            'threshold_exceptional': threshold_exceptional,
-                            'threshold_prime': threshold_prime,
-                            'threshold_excellent': threshold_excellent,
-                            'threshold_strong': threshold_strong,
-                            'rsi_low': rsi_low,
-                            'rsi_high': rsi_high,
-                            'min_revenue_yoy': min_revenue_yoy,
-                            'min_profit_yoy': min_profit_yoy
-                        })
-                        if analysis:
-                            results.append(analysis)
-                        else:
-                            filtered_out += 1
-                    else:
-                        failed += 1
-                except Exception as e:
-                    failed += 1
-                
-                # Update progress
-                current = len(results) + failed + filtered_out
-                progress_bar.progress(min(current / total, 1.0))
-                
-                # Check if stock symbol changed (fallback was used)
-                stock_display = stock
-                if data and data.get('symbol') != stock:
-                    stock_display = f"{stock} → {data['symbol']}"
-                
-                if current % 10 == 0 or current == total:
-                    valid_results_count = len([r for r in results if r is not None])
-                    qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
-                    status_text.info(f"📊 Processing {stock_display}... ({current}/{total})")
-                    stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
-                
-                # Small delay to avoid rate limiting
-                time.sleep(request_delay / max_workers)
-    
-    else:
-        # SEQUENTIAL PROCESSING MODE (original)
-        for idx, symbol in enumerate(stocks_to_scan):
-            # BULLETPROOF: Rate limiting - ensure minimum delay between requests
-            elapsed = time.time() - last_request_time
-            if elapsed < request_delay:
-                time.sleep(request_delay - elapsed)
-            
-            status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
-            
-            # BULLETPROOF: Wrap fetch in try-catch
-            try:
-                data = fetch_stock_data(symbol)
-                if data:
-                    analysis = analyze_stock(data, min_market_cap, {
-                        'threshold_exceptional': threshold_exceptional,
-                        'threshold_prime': threshold_prime,
-                        'threshold_excellent': threshold_excellent,
-                        'threshold_strong': threshold_strong,
-                        'rsi_low': rsi_low,
-                        'rsi_high': rsi_high,
-                        'min_revenue_yoy': min_revenue_yoy,
-                        'min_profit_yoy': min_profit_yoy
-                    })
-                    if analysis:
-                        results.append(analysis)
-                    else:
-                        filtered_out += 1
+        try:
+            data = fetch_stock_data(symbol)
+            if data:
+                analysis = analyze_stock(data, min_market_cap, {
+                    'threshold_exceptional': threshold_exceptional,
+                    'threshold_prime': threshold_prime,
+                    'threshold_excellent': threshold_excellent,
+                    'threshold_strong': threshold_strong,
+                    'rsi_low': rsi_low,
+                    'rsi_high': rsi_high,
+                    'min_revenue_yoy': min_revenue_yoy,
+                    'min_profit_yoy': min_profit_yoy
+                })
+                if analysis:
+                    results.append(analysis)
                 else:
-                    failed += 1
-            except Exception as e:
+                    filtered_out += 1
+            else:
                 failed += 1
-            
-            last_request_time = time.time()
-            
-            progress = (idx + 1) / total
-            progress_bar.progress(progress)
-            
-            if (idx + 1) % 10 == 0 or idx == total - 1:
-                valid_results_count = len([r for r in results if r is not None])
-                qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
-                stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
-            
-            # BULLETPROOF: Reduced sleep time since we have rate limiting above
-            time.sleep(0.1)
+        except Exception as e:
+            failed += 1
+        
+        progress = (idx + 1) / total
+        progress_bar.progress(progress)
+        
+        if (idx + 1) % 10 == 0 or idx == total - 1:
+            valid_results_count = len([r for r in results if r is not None])
+            qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
+            stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
+        
+        # Delay between requests - user configurable for best quality
+        time.sleep(request_delay)
     
     # Filter out None results before storing
     results = [r for r in results if r is not None]
