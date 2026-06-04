@@ -65,43 +65,77 @@ def fetch_stock_data(symbol):
     Symbol comes WITHOUT .NS/.BO, function adds it based on what's in the symbol
     """
     try:
-        # Symbol already has .NS or .BO added during loading
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="3mo", interval="1d")
+        # Use yf.download() for price history - avoids the ticker.info preflight
+        # that causes HTTP 403 errors with newer yfinance versions
+        hist = yf.download(symbol, period="3mo", interval="1d",
+                           progress=False, auto_adjust=True)
         
-        if hist.empty:
+        if hist is None or hist.empty:
             return None
-        
-        closes = hist['Close'].values
-        highs = hist['High'].values
-        lows = hist['Low'].values
-        volumes = hist['Volume'].values
+
+        # yf.download returns MultiIndex columns when single ticker sometimes; flatten
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+
+        closes = hist['Close'].values.astype(float)
+        highs = hist['High'].values.astype(float)
+        lows = hist['Low'].values.astype(float)
+        volumes = hist['Volume'].values.astype(float)
         
         price = closes[-1]
         prev_close = closes[-2] if len(closes) > 1 else price
         change = ((price - prev_close) / prev_close) * 100
         
-        # Get fundamental data
-        info = ticker.info
-        market_cap = info.get('marketCap', 0)
-        
-        # Revenue and profit growth
-        revenue_growth = info.get('revenueGrowth', None)
-        profit_margin = info.get('profitMargins', None)
-        earnings_growth = info.get('earningsGrowth', None)
-        
-        # Additional fundamental metrics
-        pe_ratio = info.get('trailingPE', None)
-        roe = info.get('returnOnEquity', None)
-        debt_to_equity = info.get('debtToEquity', None)
-        
-        # CASH METRICS
-        total_cash = info.get('totalCash', 0)
+        # Get fundamental data - wrap entirely so a 403 here doesn't kill price data
+        ticker = yf.Ticker(symbol)
+        try:
+            info = ticker.fast_info  # fast_info is lighter and less likely to 403
+            market_cap = getattr(info, 'market_cap', None) or 0
+        except Exception:
+            info = {}
+            market_cap = 0
+
+        # Fallback: try full info if fast_info gave zero market_cap
+        revenue_growth = None
+        profit_margin = None
+        earnings_growth = None
+        pe_ratio = None
+        roe = None
+        debt_to_equity = None
+        total_cash = 0
+        if market_cap == 0:
+            try:
+                full_info = ticker.info
+                market_cap = full_info.get('marketCap', 0) or 0
+                revenue_growth = full_info.get('revenueGrowth', None)
+                profit_margin = full_info.get('profitMargins', None)
+                earnings_growth = full_info.get('earningsGrowth', None)
+                pe_ratio = full_info.get('trailingPE', None)
+                roe = full_info.get('returnOnEquity', None)
+                debt_to_equity = full_info.get('debtToEquity', None)
+                total_cash = full_info.get('totalCash', 0) or 0
+            except Exception:
+                pass
+        else:
+            try:
+                full_info = ticker.info
+                revenue_growth = full_info.get('revenueGrowth', None)
+                profit_margin = full_info.get('profitMargins', None)
+                earnings_growth = full_info.get('earningsGrowth', None)
+                pe_ratio = full_info.get('trailingPE', None)
+                roe = full_info.get('returnOnEquity', None)
+                debt_to_equity = full_info.get('debtToEquity', None)
+                total_cash = full_info.get('totalCash', 0) or 0
+            except Exception:
+                pass
         
         # Get LATEST REPORTED FY REVENUE (most recent completed FY)
         latest_fy_revenue = 0
         try:
-            annual_financials = ticker.financials
+            try:
+                annual_financials = ticker.income_stmt
+            except Exception:
+                annual_financials = ticker.financials
             if annual_financials is not None and not annual_financials.empty:
                 if 'Total Revenue' in annual_financials.index:
                     # iloc[0] gets the MOST RECENT fiscal year
@@ -119,8 +153,12 @@ def fetch_stock_data(symbol):
         historical_data = get_historical_financials(ticker, market_cap)
         
         # Get quarterly financials for growth analysis
+        # yfinance 0.2+ renamed quarterly_financials -> quarterly_income_stmt
         try:
-            financials = ticker.quarterly_financials
+            try:
+                financials = ticker.quarterly_income_stmt
+            except Exception:
+                financials = ticker.quarterly_financials
             if financials is not None and not financials.empty:
                 # Get Total Revenue if available
                 if 'Total Revenue' in financials.index:
@@ -219,8 +257,15 @@ def fetch_stock_data(symbol):
 def get_historical_financials(ticker, current_mcap):
     """Get 3-year historical revenue, cash, and sales/mcap data"""
     try:
-        financials = ticker.financials
-        balance_sheet = ticker.balance_sheet  # ANNUAL balance sheet, not quarterly
+        # yfinance 0.2+ renamed .financials -> .income_stmt, .balance_sheet stays same
+        try:
+            financials = ticker.income_stmt
+        except Exception:
+            financials = ticker.financials
+        try:
+            balance_sheet = ticker.balance_sheet
+        except Exception:
+            balance_sheet = None
         
         historical = {
             'years': [],
@@ -273,9 +318,10 @@ def fetch_live_price(symbol):
     Symbol already has .NS or .BO suffix from file loading
     """
     try:
-        # Symbol already has exchange suffix (e.g., "RELIANCE.NS" or "TCS.BO")
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(period="1d", interval="1m")
+        data = yf.download(symbol, period="1d", interval="1m",
+                           progress=False, auto_adjust=True)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
         if data is not None and not data.empty:
             return data['Close'].iloc[-1]
         return None
