@@ -15,7 +15,26 @@ logging.getLogger('yfinance').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
 
+# yfinance 1.x requires curl_cffi for browser TLS impersonation.
+# Without it Yahoo Finance blocks all requests (403) and every ticker fails.
+try:
+    from yfinance._http import HAS_CURL_CFFI
+except Exception:
+    HAS_CURL_CFFI = False
+
 st.set_page_config(page_title="Indian Stock Scout - Ultra-Strict Scanner", page_icon="🎯", layout="wide")
+
+# Show critical dependency warning if curl_cffi is missing
+if not HAS_CURL_CFFI:
+    st.error("""
+    \u26a0\ufe0f **CRITICAL: curl_cffi not installed - ALL tickers will fail (403 errors)**
+
+    yfinance 1.x requires curl_cffi for browser TLS impersonation to access Yahoo Finance.
+    Without it, every request is blocked. Run this in your terminal then restart:
+
+        pip install curl_cffi
+    """)
+
 
 # Custom CSS
 st.markdown("""<style>
