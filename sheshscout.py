@@ -569,8 +569,9 @@ def analyze_stock(data, min_market_cap, thresholds=None):
         # Market cap filter (in crores) - BULLETPROOF: Safe division
         market_cap = data['market_cap'] / 10000000 if data['market_cap'] else 0
         
-        # Skip if below minimum market cap
-        if market_cap < min_market_cap:
+        # Skip if below minimum market cap - only filter when we HAVE a real value.
+        # market_cap=0 means ticker.info failed (403), not a zero-cap company.
+        if min_market_cap > 0 and market_cap > 0 and market_cap < min_market_cap:
             return None
         
         # OPERATOR DETECTION
@@ -1156,7 +1157,7 @@ Scans one stock at a time with delays.
 st.sidebar.markdown("---")
 st.sidebar.subheader("💰 Market Cap Filter")
 min_market_cap = st.sidebar.slider("Minimum Market Cap (₹ Crores)", 
-    0, 100000, 5000, 1000,
+    0, 100000, 0, 1000,
     help="Filter stocks by minimum market capitalization")
 
 st.sidebar.markdown("---")
@@ -1269,7 +1270,7 @@ if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_contain
         if (idx + 1) % 10 == 0 or idx == total - 1:
             valid_results_count = len([r for r in results if r is not None])
             qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
-            stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
+            stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered(mcap): {filtered_out} | Failed(fetch): {failed} | Processed: {idx+1}/{total}")
         
         # Delay between requests - user configurable for best quality
         time.sleep(request_delay)
