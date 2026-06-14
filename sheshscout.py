@@ -25,6 +25,7 @@ import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging to show warnings but not info
 warnings.filterwarnings('ignore')
@@ -1107,15 +1108,22 @@ else:
     st.sidebar.subheader("⚡ Rate Limiting Controls")
 
     st.sidebar.info("""
-    **ℹ️ Sequential Processing (Best Quality):**
-    Scans one stock at a time with delays.  
-    Default settings work reliably — only increase if you hit rate limits.
+    **⚡ Concurrent Scan (Default: 8 workers)**  
+    Fetches multiple stocks in parallel — 4–8× faster than sequential.  
+    Reduce workers to 2–3 if you get frequent 429 rate-limit errors.
     """)
 
+    max_workers_ui = st.sidebar.slider(
+        "Parallel workers",
+        min_value=1, max_value=16, value=8, step=1,
+        help="How many stocks to fetch simultaneously. 8 is a good default. Lower if hitting rate limits.",
+        key="sp_max_workers"
+    )
+
     request_delay = st.sidebar.number_input(
-        "Delay between stocks (sec)",
-        min_value=0.1, max_value=30.0, value=0.3, step=0.1,
-        help="Pause after each ticker. Default 0.3s works. Increase to 1–3s if getting 429 errors.",
+        "Per-worker delay (sec)",
+        min_value=0.0, max_value=5.0, value=0.1, step=0.05,
+        help="Small pause inside each worker between retries. 0.1s default. Increase only if hitting 429s.",
         key="sp_req_delay"
     )
 
@@ -1128,7 +1136,7 @@ else:
 
     batch_pause_sp = st.sidebar.number_input(
         "Batch pause (sec)",
-        min_value=5, max_value=300, value=60, step=5,
+        min_value=5, max_value=300, value=30, step=5,
         help="How long to pause after each batch. Only used if batch size > 0.",
         key="sp_batch_pause"
     )
@@ -1241,50 +1249,69 @@ else:
         total = len(stocks_to_scan)
         failed = 0
         filtered_out = 0
+        completed = 0
 
         start_time = time.time()
 
-        # SEQUENTIAL PROCESSING ONLY (Best Quality - No Rate Limiting Issues)
-        for idx, symbol in enumerate(stocks_to_scan):
-            status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
+        _thresholds = {
+            'threshold_exceptional': threshold_exceptional,
+            'threshold_prime': threshold_prime,
+            'threshold_excellent': threshold_excellent,
+            'threshold_strong': threshold_strong,
+            'rsi_low': rsi_low,
+            'rsi_high': rsi_high,
+            'min_revenue_yoy': min_revenue_yoy,
+            'min_profit_yoy': min_profit_yoy
+        }
 
+        def _fetch_and_analyze(symbol):
+            """Worker: fetch + analyze one symbol. Returns (symbol, analysis|None, status)"""
             try:
+                if request_delay > 0:
+                    time.sleep(request_delay)
                 data = fetch_stock_data(symbol)
-                if data:
-                    analysis = analyze_stock(data, min_market_cap, {
-                        'threshold_exceptional': threshold_exceptional,
-                        'threshold_prime': threshold_prime,
-                        'threshold_excellent': threshold_excellent,
-                        'threshold_strong': threshold_strong,
-                        'rsi_low': rsi_low,
-                        'rsi_high': rsi_high,
-                        'min_revenue_yoy': min_revenue_yoy,
-                        'min_profit_yoy': min_profit_yoy
-                    })
-                    if analysis:
-                        results.append(analysis)
-                    else:
-                        filtered_out += 1
+                if data is None:
+                    return symbol, None, 'failed'
+                analysis = analyze_stock(data, min_market_cap, _thresholds)
+                if analysis is None:
+                    return symbol, None, 'filtered'
+                return symbol, analysis, 'ok'
+            except Exception:
+                return symbol, None, 'failed'
+
+        # ── CONCURRENT SCAN ──────────────────────────────────────────────────
+        _max_workers = min(max_workers_ui, total)
+        status_text.info(f"⚡ Concurrent scan: {_max_workers} workers × {total} stocks")
+
+        with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+            future_to_sym = {executor.submit(_fetch_and_analyze, sym): sym for sym in stocks_to_scan}
+
+            for future in as_completed(future_to_sym):
+                symbol, analysis, status = future.result()
+                completed += 1
+
+                if status == 'ok':
+                    results.append(analysis)
+                elif status == 'filtered':
+                    filtered_out += 1
                 else:
                     failed += 1
-            except Exception as e:
-                failed += 1
 
-            progress = (idx + 1) / total
-            progress_bar.progress(progress)
+                progress_bar.progress(completed / total)
 
-            if (idx + 1) % stats_interval == 0 or idx == total - 1:
-                valid_results_count = len([r for r in results if r is not None])
-                qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
-                stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
-
-            # Delay between requests - user configurable for best quality
-            time.sleep(request_delay)
-
-            # Batch pause
-            if batch_size_sp > 0 and (idx + 1) % batch_size_sp == 0 and (idx + 1) < total:
-                status_text.warning(f"⏸️ Batch pause: waiting {batch_pause_sp}s after {idx+1} stocks...")
-                time.sleep(batch_pause_sp)
+                if completed % stats_interval == 0 or completed == total:
+                    qualified_count = sum(1 for r in results if r.get('qualified', False))
+                    elapsed = (time.time() - start_time)
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    eta = (total - completed) / rate if rate > 0 else 0
+                    status_text.info(
+                        f"📊 {completed}/{total} done · ✅ {len(results)} valid · "
+                        f"🎯 {qualified_count} qualified · ⏱ ETA {eta:.0f}s"
+                    )
+                    stats_placeholder.info(
+                        f"✅ Valid: {len(results)} | Qualified (≥{threshold_excellent}): {qualified_count} "
+                        f"| Filtered: {filtered_out} | Failed: {failed}"
+                    )
 
         # Filter out None results before storing
         results = [r for r in results if r is not None]
