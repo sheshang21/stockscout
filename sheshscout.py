@@ -1,7 +1,24 @@
 import streamlit as st
-import yfinance as yf
+# ── yf_ratelimit shim ──────────────────────────────────────────
+# Replaces direct yfinance calls with rate-limit-safe wrappers.
+# DO NOT remove this block.
+from yf_ratelimit import safe_ticker as _rl_ticker, safe_download as _rl_download
+
+class _YFShim:
+    """Makes existing yf.Ticker() / yf.download() calls use safe wrappers."""
+    @staticmethod
+    def Ticker(symbol, **_):
+        return _rl_ticker(symbol)
+    @staticmethod
+    def download(tickers, **kwargs):
+        return _rl_download(tickers, **kwargs)
+
+yf = _YFShim()
+# ── end shim ───────────────────────────────────────────────────
+
 import pandas as pd
 import numpy as np
+from yfinance_compat import safe_financials, safe_cashflow, safe_download, parse_news_item
 from datetime import datetime, timedelta
 import warnings
 import time
@@ -15,29 +32,10 @@ logging.getLogger('yfinance').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
 
-# yfinance 1.x requires curl_cffi for browser TLS impersonation.
-# Without it Yahoo Finance blocks all requests (403) and every ticker fails.
-try:
-    from yfinance._http import HAS_CURL_CFFI
-except Exception:
-    HAS_CURL_CFFI = False
-
-st.set_page_config(page_title="Indian Stock Scout - Ultra-Strict Scanner", page_icon="🎯", layout="wide")
-
-# Show critical dependency warning if curl_cffi is missing
-if not HAS_CURL_CFFI:
-    st.error("""
-    \u26a0\ufe0f **CRITICAL: curl_cffi not installed - ALL tickers will fail (403 errors)**
-
-    yfinance 1.x requires curl_cffi for browser TLS impersonation to access Yahoo Finance.
-    Without it, every request is blocked. Run this in your terminal then restart:
-
-        pip install curl_cffi
-    """)
-
-
-# Custom CSS
-st.markdown("""<style>
+if __name__ == "__main__":
+    st.set_page_config(page_title="Indian Stock Scout - Ultra-Strict Scanner", page_icon="🎯", layout="wide")
+    # Custom CSS (standalone mode only)
+    st.markdown("""<style>
 .main-header{font-size:2.5rem;font-weight:700;color:#1f77b4;text-align:center;margin-bottom:1rem}
 .sub-header{font-size:1.5rem;font-weight:600;color:#333;margin:1rem 0}
 .metric-card{background:#f8f9fb;padding:0.8rem;border-radius:8px;border-left:4px solid #1f77b4;margin:0.5rem 0}
@@ -60,20 +58,27 @@ SECTOR_MAP = {
 }
 
 # BULLETPROOF: Retry wrapper with exponential backoff
-def bulletproof_fetch(func, *args, max_retries=3, initial_delay=1, **kwargs):
+# max_retries and initial_delay are set by UI controls (see sidebar Rate Limiting section)
+# Defaults: max_retries=3, initial_delay=1 — these work reliably out of the box
+_RETRY_MAX = 3
+_RETRY_INITIAL_DELAY = 1
+
+def bulletproof_fetch(func, *args, max_retries=None, initial_delay=None, **kwargs):
     """Wrapper that adds retry logic with exponential backoff to any function"""
-    for attempt in range(max_retries):
+    _retries = max_retries if max_retries is not None else _RETRY_MAX
+    _delay   = initial_delay if initial_delay is not None else _RETRY_INITIAL_DELAY
+    for attempt in range(_retries):
         try:
             # Add small delay before each attempt to avoid rate limiting
             if attempt > 0:
-                time.sleep(initial_delay * (2 ** (attempt - 1)))  # Exponential backoff
+                time.sleep(_delay * (2 ** (attempt - 1)))  # Exponential backoff
             return func(*args, **kwargs)
         except Exception as e:
-            if attempt == max_retries - 1:
+            if attempt == _retries - 1:
                 # Last attempt failed, return None silently
                 return None
             # Continue to next attempt
-            time.sleep(initial_delay * (2 ** attempt))
+            time.sleep(_delay * (2 ** attempt))
     return None
 
 @st.cache_data(ttl=300)
@@ -84,77 +89,43 @@ def fetch_stock_data(symbol):
     Symbol comes WITHOUT .NS/.BO, function adds it based on what's in the symbol
     """
     try:
-        # Use yf.download() for price history - avoids the ticker.info preflight
-        # that causes HTTP 403 errors with newer yfinance versions
-        hist = yf.download(symbol, period="3mo", interval="1d",
-                           progress=False, auto_adjust=True)
+        # Symbol already has .NS or .BO added during loading
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="3mo", interval="1d")
         
-        if hist is None or hist.empty:
+        if hist.empty:
             return None
-
-        # yf.download returns MultiIndex columns when single ticker sometimes; flatten
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-
-        closes = hist['Close'].values.astype(float)
-        highs = hist['High'].values.astype(float)
-        lows = hist['Low'].values.astype(float)
-        volumes = hist['Volume'].values.astype(float)
+        
+        closes = hist['Close'].values
+        highs = hist['High'].values
+        lows = hist['Low'].values
+        volumes = hist['Volume'].values
         
         price = closes[-1]
         prev_close = closes[-2] if len(closes) > 1 else price
         change = ((price - prev_close) / prev_close) * 100
         
-        # Get fundamental data - wrap entirely so a 403 here doesn't kill price data
-        ticker = yf.Ticker(symbol)
-        try:
-            info = ticker.fast_info  # fast_info is lighter and less likely to 403
-            market_cap = getattr(info, 'market_cap', None) or 0
-        except Exception:
-            info = {}
-            market_cap = 0
-
-        # Fallback: try full info if fast_info gave zero market_cap
-        revenue_growth = None
-        profit_margin = None
-        earnings_growth = None
-        pe_ratio = None
-        roe = None
-        debt_to_equity = None
-        total_cash = 0
-        if market_cap == 0:
-            try:
-                full_info = ticker.info
-                market_cap = full_info.get('marketCap', 0) or 0
-                revenue_growth = full_info.get('revenueGrowth', None)
-                profit_margin = full_info.get('profitMargins', None)
-                earnings_growth = full_info.get('earningsGrowth', None)
-                pe_ratio = full_info.get('trailingPE', None)
-                roe = full_info.get('returnOnEquity', None)
-                debt_to_equity = full_info.get('debtToEquity', None)
-                total_cash = full_info.get('totalCash', 0) or 0
-            except Exception:
-                pass
-        else:
-            try:
-                full_info = ticker.info
-                revenue_growth = full_info.get('revenueGrowth', None)
-                profit_margin = full_info.get('profitMargins', None)
-                earnings_growth = full_info.get('earningsGrowth', None)
-                pe_ratio = full_info.get('trailingPE', None)
-                roe = full_info.get('returnOnEquity', None)
-                debt_to_equity = full_info.get('debtToEquity', None)
-                total_cash = full_info.get('totalCash', 0) or 0
-            except Exception:
-                pass
+        # Get fundamental data
+        info = ticker.info
+        market_cap = info.get('marketCap', 0)
+        
+        # Revenue and profit growth
+        revenue_growth = info.get('revenueGrowth', None)
+        profit_margin = info.get('profitMargins', None)
+        earnings_growth = info.get('earningsGrowth', None)
+        
+        # Additional fundamental metrics
+        pe_ratio = info.get('trailingPE', None)
+        roe = info.get('returnOnEquity', None)
+        debt_to_equity = info.get('debtToEquity', None)
+        
+        # CASH METRICS
+        total_cash = info.get('totalCash', 0)
         
         # Get LATEST REPORTED FY REVENUE (most recent completed FY)
         latest_fy_revenue = 0
         try:
-            try:
-                annual_financials = ticker.income_stmt
-            except Exception:
-                annual_financials = ticker.financials
+            annual_financials = ticker.income_stmt if hasattr(ticker, 'income_stmt') else ticker.financials
             if annual_financials is not None and not annual_financials.empty:
                 if 'Total Revenue' in annual_financials.index:
                     # iloc[0] gets the MOST RECENT fiscal year
@@ -172,12 +143,8 @@ def fetch_stock_data(symbol):
         historical_data = get_historical_financials(ticker, market_cap)
         
         # Get quarterly financials for growth analysis
-        # yfinance 0.2+ renamed quarterly_financials -> quarterly_income_stmt
         try:
-            try:
-                financials = ticker.quarterly_income_stmt
-            except Exception:
-                financials = ticker.quarterly_financials
+            financials = ticker.quarterly_income_stmt if hasattr(ticker, 'quarterly_income_stmt') else ticker.quarterly_financials
             if financials is not None and not financials.empty:
                 # Get Total Revenue if available
                 if 'Total Revenue' in financials.index:
@@ -276,15 +243,8 @@ def fetch_stock_data(symbol):
 def get_historical_financials(ticker, current_mcap):
     """Get 3-year historical revenue, cash, and sales/mcap data"""
     try:
-        # yfinance 0.2+ renamed .financials -> .income_stmt, .balance_sheet stays same
-        try:
-            financials = ticker.income_stmt
-        except Exception:
-            financials = ticker.financials
-        try:
-            balance_sheet = ticker.balance_sheet
-        except Exception:
-            balance_sheet = None
+        financials = ticker.income_stmt if hasattr(ticker, 'income_stmt') else ticker.financials
+        balance_sheet = ticker.balance_sheet  # ANNUAL balance sheet, not quarterly
         
         historical = {
             'years': [],
@@ -337,10 +297,9 @@ def fetch_live_price(symbol):
     Symbol already has .NS or .BO suffix from file loading
     """
     try:
-        data = yf.download(symbol, period="1d", interval="1m",
-                           progress=False, auto_adjust=True)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+        # Symbol already has exchange suffix (e.g., "RELIANCE.NS" or "TCS.BO")
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period="1d", interval="1m")
         if data is not None and not data.empty:
             return data['Close'].iloc[-1]
         return None
@@ -569,9 +528,8 @@ def analyze_stock(data, min_market_cap, thresholds=None):
         # Market cap filter (in crores) - BULLETPROOF: Safe division
         market_cap = data['market_cap'] / 10000000 if data['market_cap'] else 0
         
-        # Skip if below minimum market cap - only filter when we HAVE a real value.
-        # market_cap=0 means ticker.info failed (403), not a zero-cap company.
-        if min_market_cap > 0 and market_cap > 0 and market_cap < min_market_cap:
+        # Skip if below minimum market cap
+        if market_cap < min_market_cap:
             return None
         
         # OPERATOR DETECTION
@@ -970,824 +928,877 @@ def analyze_stock(data, min_market_cap, thresholds=None):
         # Silently return None on error
         return None
 
-# Main App
-st.markdown('<p class="main-header">🎯 Indian Stock Scout - NSE & BSE Ultra-Strict Scanner</p>', unsafe_allow_html=True)
-st.markdown("*Choose NSE, BSE, or BOTH | Only stocks with EXCEPTIONAL fundamentals + technicals qualify*")
 
-# Show exchange summary prominently
-if 'AVAILABLE_STOCKS' in locals() and len(AVAILABLE_STOCKS) > 0:
-    if scan_nse and scan_bse:
-        banner_text = f"📈 Scanning BOTH Exchanges: NSE ({NSE_COUNT}) + BSE ({BSE_COUNT}) = {len(AVAILABLE_STOCKS)} Total"
-        banner_color = "linear-gradient(90deg, #1f77b4 0%, #1f77b4 50%, #ff7f0e 50%, #ff7f0e 100%)"
-    elif scan_nse:
-        banner_text = f"📈 Scanning NSE Only: {NSE_COUNT} stocks loaded"
-        banner_color = "#1f77b4"
-    else:
-        banner_text = f"📈 Scanning BSE Only: {BSE_COUNT} stocks loaded"
-        banner_color = "#ff7f0e"
-    
-    st.markdown(f"""
-    <div style='text-align:center;background: {banner_color};padding:0.8rem;border-radius:8px;margin:1rem 0;'>
-    <p style='color:white;font-size:1.2rem;font-weight:bold;margin:0;'>
-    {banner_text}
-    </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-# Sidebar
-st.sidebar.header("⚙ Scanner Configuration")
-
-# Exchange selection with checkboxes
-st.sidebar.subheader("📈 Select Exchanges to Scan")
-scan_nse = st.sidebar.checkbox("✅ Scan NSE Stocks", value=True, help="Loads stocks from nse.txt and adds .NS suffix")
-scan_bse = st.sidebar.checkbox("✅ Scan BSE Stocks", value=True, help="Loads stocks from bse.txt and adds .BO suffix")
-
-if not scan_nse and not scan_bse:
-    st.sidebar.error("⚠️ Please select at least one exchange!")
-    AVAILABLE_STOCKS = []
-    NSE_COUNT = 0
-    BSE_COUNT = 0
+# ── IMPORT GUARD: skip all UI rendering when loaded as a module ──────────
+_RUNNING_STANDALONE = (__name__ == '__main__')
+if not _RUNNING_STANDALONE:
+    # Imported by dashboard — expose only functions, no UI rendering
+    pass
 else:
-    # Load stocks based on selection - SIMPLE LOGIC
-    AVAILABLE_STOCKS = []
-    NSE_COUNT = 0
-    BSE_COUNT = 0
-    
-    if scan_nse:
-        try:
-            with open('nse.txt', 'r') as f:
-                # Just load the stock names (like RELIANCE, TCS, etc.)
-                nse_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
-            
-            if nse_stocks:
-                # Add .NS suffix to each
-                for stock in nse_stocks:
-                    AVAILABLE_STOCKS.append(f"{stock}.NS")
-                NSE_COUNT = len(nse_stocks)
-        except FileNotFoundError:
-            st.sidebar.warning("⚠️ nse.txt not found")
-        except Exception as e:
-            st.sidebar.error(f"❌ Error loading nse.txt: {str(e)}")
-    
-    if scan_bse:
-        try:
-            with open('bse.txt', 'r') as f:
-                # Just load the stock names (like RELIANCE, TCS, etc.)
-                bse_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
-            
-            if bse_stocks:
-                # Add .BO suffix to each
-                for stock in bse_stocks:
-                    AVAILABLE_STOCKS.append(f"{stock}.BO")
-                BSE_COUNT = len(bse_stocks)
-        except FileNotFoundError:
-            st.sidebar.warning("⚠️ bse.txt not found")
-        except Exception as e:
-            st.sidebar.error(f"❌ Error loading bse.txt: {str(e)}")
-    
-    # Remove duplicates if any
-    AVAILABLE_STOCKS = list(dict.fromkeys(AVAILABLE_STOCKS))
-    
-    if AVAILABLE_STOCKS:
-        exchange_text = []
-        if scan_nse:
-            exchange_text.append(f"NSE: {NSE_COUNT}")
-        if scan_bse:
-            exchange_text.append(f"BSE: {BSE_COUNT}")
-        
-        st.sidebar.success(f"✅ Loaded {len(AVAILABLE_STOCKS)} stocks\n" + " | ".join(exchange_text))
-    else:
-        st.sidebar.error("❌ No stocks loaded")
+    # ── STANDALONE MODE: run the full Streamlit app ────────────────────
 
-st.sidebar.markdown("---")
+    # Main App
+    st.markdown('<p class="main-header">🎯 Indian Stock Scout - NSE & BSE Ultra-Strict Scanner</p>', unsafe_allow_html=True)
+    st.markdown("*Choose NSE, BSE, or BOTH | Only stocks with EXCEPTIONAL fundamentals + technicals qualify*")
 
-scan_mode = st.sidebar.radio("Scan Mode", 
-    ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Slot-wise Scan", "Custom List"])
-
-if scan_mode == "Quick Scan (50 stocks)":
-    stocks_to_scan = AVAILABLE_STOCKS[:50]
-elif scan_mode == "Full Scan (All stocks)":
-    stocks_to_scan = AVAILABLE_STOCKS
-elif scan_mode == "Slot-wise Scan":
-    st.sidebar.subheader("📦 Select Slots to Scan")
-    
-    total_stocks = len(AVAILABLE_STOCKS)
-    slot_size = 1000
-    num_slots = (total_stocks + slot_size - 1) // slot_size  # Ceiling division
-    
-    st.sidebar.info(f"📊 Total stocks: {total_stocks}\n💼 Slot size: 1000 stocks\n📦 Total slots: {num_slots}")
-    
-    # Helper buttons for quick selection
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        if st.button("✅ Select All", use_container_width=True):
-            for slot_num in range(num_slots):
-                st.session_state[f"slot_{slot_num}"] = True
-            st.rerun()
-    with col2:
-        if st.button("❌ Deselect All", use_container_width=True):
-            for slot_num in range(num_slots):
-                st.session_state[f"slot_{slot_num}"] = False
-            st.rerun()
-    
-    st.sidebar.markdown("---")
-    
-    # Create checkboxes for each slot with exchange breakdown
-    selected_slots = []
-    for slot_num in range(num_slots):
-        start_idx = slot_num * slot_size
-        end_idx = min((slot_num + 1) * slot_size, total_stocks)
-        slot_stocks = AVAILABLE_STOCKS[start_idx:end_idx]
-        slot_count = len(slot_stocks)
-        
-        # Count NSE and BSE in this slot
-        nse_in_slot = sum(1 for s in slot_stocks if '.NS' in s)
-        bse_in_slot = sum(1 for s in slot_stocks if '.BO' in s)
-        
-        slot_label = f"Slot {slot_num + 1}: {start_idx + 1}-{end_idx}"
-        slot_detail = f"({slot_count}: {nse_in_slot} NSE, {bse_in_slot} BSE)"
-        
-        if st.sidebar.checkbox(f"{slot_label} {slot_detail}", key=f"slot_{slot_num}"):
-            selected_slots.append(slot_num)
-    
-    # Build stocks list from selected slots
-    stocks_to_scan = []
-    for slot_num in selected_slots:
-        start_idx = slot_num * slot_size
-        end_idx = min((slot_num + 1) * slot_size, total_stocks)
-        stocks_to_scan.extend(AVAILABLE_STOCKS[start_idx:end_idx])
-    
-    if not selected_slots:
-        st.sidebar.warning("⚠️ Please select at least one slot to scan")
-        stocks_to_scan = []
-    else:
-        nse_selected = sum(1 for s in stocks_to_scan if '.NS' in s)
-        bse_selected = sum(1 for s in stocks_to_scan if '.BO' in s)
-        st.sidebar.success(f"✅ {len(selected_slots)} slot(s) selected\n📊 Total: {len(stocks_to_scan)} stocks\n🔵 NSE: {nse_selected} | 🟠 BSE: {bse_selected}")
-else:
-    custom_input = st.sidebar.text_area("Enter symbols (one per line)", 
-        'Stock names with exchange suffix:\nRELIANCE.NS\nTCS.BO\nINFY.NS\n\nOr without (defaults to NSE):\nRELIANCE\nTCS', height=150)
-    raw_symbols = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
-    stocks_to_scan = []
-    for symbol in raw_symbols:
-        if '.NS' in symbol or '.BO' in symbol:
-            stocks_to_scan.append(symbol)
+    # Show exchange summary prominently
+    if 'AVAILABLE_STOCKS' in locals() and len(AVAILABLE_STOCKS) > 0:
+        if scan_nse and scan_bse:
+            banner_text = f"📈 Scanning BOTH Exchanges: NSE ({NSE_COUNT}) + BSE ({BSE_COUNT}) = {len(AVAILABLE_STOCKS)} Total"
+            banner_color = "linear-gradient(90deg, #1f77b4 0%, #1f77b4 50%, #ff7f0e 50%, #ff7f0e 100%)"
+        elif scan_nse:
+            banner_text = f"📈 Scanning NSE Only: {NSE_COUNT} stocks loaded"
+            banner_color = "#1f77b4"
         else:
-            # Default to NSE if no exchange specified
-            stocks_to_scan.append(f"{symbol}.NS")
+            banner_text = f"📈 Scanning BSE Only: {BSE_COUNT} stocks loaded"
+            banner_color = "#ff7f0e"
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚡ Scanning Speed")
+        st.markdown(f"""
+        <div style='text-align:center;background: {banner_color};padding:0.8rem;border-radius:8px;margin:1rem 0;'>
+        <p style='color:white;font-size:1.2rem;font-weight:bold;margin:0;'>
+        {banner_text}
+        </p>
+        </div>
+        """, unsafe_allow_html=True)
 
-request_delay = st.sidebar.slider("Delay between requests (sec)", 0.1, 2.0, 0.3, 0.1,
-    help="Delay between each stock scan. Higher = slower but better success rate. Lower = faster but may get rate limited.")
+    # Sidebar
+    st.sidebar.header("⚙ Scanner Configuration")
 
-st.sidebar.info("""
-**ℹ️ Sequential Processing (Best Quality):**
+    # Exchange selection with checkboxes
+    st.sidebar.subheader("📈 Select Exchanges to Scan")
+    scan_nse = st.sidebar.checkbox("✅ Scan NSE Stocks", value=True, help="Loads stocks from nse.txt and adds .NS suffix")
+    scan_bse = st.sidebar.checkbox("✅ Scan BSE Stocks", value=True, help="Loads stocks from bse.txt and adds .BO suffix")
 
-Scans one stock at a time with delays.
-- More reliable
-- Better success rate  
-- No rate limiting issues
-- Recommended: 0.3 seconds
+    if not scan_nse and not scan_bse:
+        st.sidebar.error("⚠️ Please select at least one exchange!")
+        AVAILABLE_STOCKS = []
+        NSE_COUNT = 0
+        BSE_COUNT = 0
+    else:
+        # Load stocks based on selection - SIMPLE LOGIC
+        AVAILABLE_STOCKS = []
+        NSE_COUNT = 0
+        BSE_COUNT = 0
 
-**Note:** Parallel processing removed because it causes Yahoo Finance to block requests, resulting in failed tickers.
-""")
+        if scan_nse:
+            try:
+                with open('nse.txt', 'r') as f:
+                    # Just load the stock names (like RELIANCE, TCS, etc.)
+                    nse_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("💰 Market Cap Filter")
-min_market_cap = st.sidebar.slider("Minimum Market Cap (₹ Crores)", 
-    0, 100000, 0, 1000,
-    help="Filter stocks by minimum market capitalization")
+                if nse_stocks:
+                    # Add .NS suffix to each
+                    for stock in nse_stocks:
+                        AVAILABLE_STOCKS.append(f"{stock}.NS")
+                    NSE_COUNT = len(nse_stocks)
+            except FileNotFoundError:
+                st.sidebar.warning("⚠️ nse.txt not found")
+            except Exception as e:
+                st.sidebar.error(f"❌ Error loading nse.txt: {str(e)}")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Adjustable Scoring Thresholds")
+        if scan_bse:
+            try:
+                with open('bse.txt', 'r') as f:
+                    # Just load the stock names (like RELIANCE, TCS, etc.)
+                    bse_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
 
-with st.sidebar.expander("📊 Customize Score Thresholds", expanded=False):
-    st.markdown("**Qualification Scores:**")
-    threshold_exceptional = st.number_input("Exceptional (≥)", 100, 250, 180, 10)
-    threshold_prime = st.number_input("Prime (≥)", 100, 250, 160, 10)
-    threshold_excellent = st.number_input("Excellent (≥)", 100, 250, 140, 10)
-    threshold_strong = st.number_input("Strong (≥)", 50, 200, 120, 10)
-    
-    st.markdown("**Technical Thresholds:**")
-    rsi_low = st.number_input("RSI Lower Bound", 20, 50, 32, 1)
-    rsi_high = st.number_input("RSI Upper Bound", 30, 60, 38, 1)
-    
-    st.markdown("**Growth Thresholds:**")
-    min_revenue_yoy = st.number_input("Min Revenue YoY %", 0, 50, 20, 5)
-    min_profit_yoy = st.number_input("Min Profit YoY %", 0, 50, 25, 5)
+                if bse_stocks:
+                    # Add .BO suffix to each
+                    for stock in bse_stocks:
+                        AVAILABLE_STOCKS.append(f"{stock}.BO")
+                    BSE_COUNT = len(bse_stocks)
+            except FileNotFoundError:
+                st.sidebar.warning("⚠️ bse.txt not found")
+            except Exception as e:
+                st.sidebar.error(f"❌ Error loading bse.txt: {str(e)}")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 ULTRA-STRICT Criteria")
-st.sidebar.info("""
-*Only top 1-3% qualify!*
+        # Remove duplicates if any
+        AVAILABLE_STOCKS = list(dict.fromkeys(AVAILABLE_STOCKS))
 
-**TOTAL: 250 Points**
+        if AVAILABLE_STOCKS:
+            exchange_text = []
+            if scan_nse:
+                exchange_text.append(f"NSE: {NSE_COUNT}")
+            if scan_bse:
+                exchange_text.append(f"BSE: {BSE_COUNT}")
 
-**Fundamentals (80 pts):**
-1. Market Cap (15 pts)
-2. Revenue Growth (25 pts)
-   - YoY ≥20%, QoQ ≥10%
-3. Profit Growth (25 pts)
-   - YoY ≥25%, QoQ ≥15%
-4. Profit Margin (15 pts)
-   - ≥15% excellent
+            st.sidebar.success(f"✅ Loaded {len(AVAILABLE_STOCKS)} stocks\n" + " | ".join(exchange_text))
+        else:
+            st.sidebar.error("❌ No stocks loaded")
 
-**Technicals (170 pts):**
-5. FII/DII (20 pts)
-6. Consolidation (20 pts)
-7. RSI (20 pts): 32-38
-8. MACD (15 pts): -1 to +1
-9. BB (15 pts): 8-20%
-10. Volume (15 pts): 1.3-1.8x
-11. Today (10 pts)
-12. Monthly (10 pts)
-13. 3-Month (10 pts)
-14. Upside (10 pts): ≥12%
+    st.sidebar.markdown("---")
 
-**Qualification:**
-- Exceptional: ≥180 pts
-- Prime: 160-179 pts
-- Excellent: 140-159 pts ✅
-- Strong: 120-139 pts
-- Below 140: Not qualified
+    scan_mode = st.sidebar.radio("Scan Mode", 
+        ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Slot-wise Scan", "Custom List"])
 
-**Penalties:**
-- Operated: -70 pts
-- High Risk: -25 to -40 pts
-""")
+    if scan_mode == "Quick Scan (50 stocks)":
+        stocks_to_scan = AVAILABLE_STOCKS[:50]
+    elif scan_mode == "Full Scan (All stocks)":
+        stocks_to_scan = AVAILABLE_STOCKS
+    elif scan_mode == "Slot-wise Scan":
+        st.sidebar.subheader("📦 Select Slots to Scan")
 
-st.sidebar.markdown("---")
+        total_stocks = len(AVAILABLE_STOCKS)
+        slot_size = 1000
+        num_slots = (total_stocks + slot_size - 1) // slot_size  # Ceiling division
 
-if 'scan_results' not in st.session_state:
-    st.session_state.scan_results = None
+        st.sidebar.info(f"📊 Total stocks: {total_stocks}\n💼 Slot size: 1000 stocks\n📦 Total slots: {num_slots}")
 
-if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_container_width=True):
-    st.markdown("---")
-    st.subheader("📊 Scanning with Fundamental + Technical Analysis...")
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    stats_placeholder = st.empty()
-    
-    results = []
-    total = len(stocks_to_scan)
-    failed = 0
-    filtered_out = 0
-    
-    start_time = time.time()
-    
-    # SEQUENTIAL PROCESSING ONLY (Best Quality - No Rate Limiting Issues)
-    for idx, symbol in enumerate(stocks_to_scan):
-        status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
-        
-        try:
-            data = fetch_stock_data(symbol)
-            if data:
-                analysis = analyze_stock(data, min_market_cap, {
-                    'threshold_exceptional': threshold_exceptional,
-                    'threshold_prime': threshold_prime,
-                    'threshold_excellent': threshold_excellent,
-                    'threshold_strong': threshold_strong,
-                    'rsi_low': rsi_low,
-                    'rsi_high': rsi_high,
-                    'min_revenue_yoy': min_revenue_yoy,
-                    'min_profit_yoy': min_profit_yoy
-                })
-                if analysis:
-                    results.append(analysis)
-                else:
-                    filtered_out += 1
+        # Helper buttons for quick selection
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            if st.button("✅ Select All", use_container_width=True):
+                for slot_num in range(num_slots):
+                    st.session_state[f"slot_{slot_num}"] = True
+                st.rerun()
+        with col2:
+            if st.button("❌ Deselect All", use_container_width=True):
+                for slot_num in range(num_slots):
+                    st.session_state[f"slot_{slot_num}"] = False
+                st.rerun()
+
+        st.sidebar.markdown("---")
+
+        # Create checkboxes for each slot with exchange breakdown
+        selected_slots = []
+        for slot_num in range(num_slots):
+            start_idx = slot_num * slot_size
+            end_idx = min((slot_num + 1) * slot_size, total_stocks)
+            slot_stocks = AVAILABLE_STOCKS[start_idx:end_idx]
+            slot_count = len(slot_stocks)
+
+            # Count NSE and BSE in this slot
+            nse_in_slot = sum(1 for s in slot_stocks if '.NS' in s)
+            bse_in_slot = sum(1 for s in slot_stocks if '.BO' in s)
+
+            slot_label = f"Slot {slot_num + 1}: {start_idx + 1}-{end_idx}"
+            slot_detail = f"({slot_count}: {nse_in_slot} NSE, {bse_in_slot} BSE)"
+
+            if st.sidebar.checkbox(f"{slot_label} {slot_detail}", key=f"slot_{slot_num}"):
+                selected_slots.append(slot_num)
+
+        # Build stocks list from selected slots
+        stocks_to_scan = []
+        for slot_num in selected_slots:
+            start_idx = slot_num * slot_size
+            end_idx = min((slot_num + 1) * slot_size, total_stocks)
+            stocks_to_scan.extend(AVAILABLE_STOCKS[start_idx:end_idx])
+
+        if not selected_slots:
+            st.sidebar.warning("⚠️ Please select at least one slot to scan")
+            stocks_to_scan = []
+        else:
+            nse_selected = sum(1 for s in stocks_to_scan if '.NS' in s)
+            bse_selected = sum(1 for s in stocks_to_scan if '.BO' in s)
+            st.sidebar.success(f"✅ {len(selected_slots)} slot(s) selected\n📊 Total: {len(stocks_to_scan)} stocks\n🔵 NSE: {nse_selected} | 🟠 BSE: {bse_selected}")
+    else:
+        custom_input = st.sidebar.text_area("Enter symbols (one per line)", 
+            'Stock names with exchange suffix:\nRELIANCE.NS\nTCS.BO\nINFY.NS\n\nOr without (defaults to NSE):\nRELIANCE\nTCS', height=150)
+        raw_symbols = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
+        stocks_to_scan = []
+        for symbol in raw_symbols:
+            if '.NS' in symbol or '.BO' in symbol:
+                stocks_to_scan.append(symbol)
             else:
+                # Default to NSE if no exchange specified
+                stocks_to_scan.append(f"{symbol}.NS")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚡ Rate Limiting Controls")
+
+    st.sidebar.info("""
+    **ℹ️ Sequential Processing (Best Quality):**
+    Scans one stock at a time with delays.  
+    Default settings work reliably — only increase if you hit rate limits.
+    """)
+
+    request_delay = st.sidebar.number_input(
+        "Delay between stocks (sec)",
+        min_value=0.1, max_value=30.0, value=0.3, step=0.1,
+        help="Pause after each ticker. Default 0.3s works. Increase to 1–3s if getting 429 errors.",
+        key="sp_req_delay"
+    )
+
+    batch_size_sp = st.sidebar.number_input(
+        "Batch size (0 = no batching)",
+        min_value=0, max_value=1000, value=0, step=10,
+        help="Pause after every N stocks. 0 disables. Use 50–100 if heavy rate limiting.",
+        key="sp_batch_size"
+    )
+
+    batch_pause_sp = st.sidebar.number_input(
+        "Batch pause (sec)",
+        min_value=5, max_value=300, value=60, step=5,
+        help="How long to pause after each batch. Only used if batch size > 0.",
+        key="sp_batch_pause"
+    )
+
+    with st.sidebar.expander("🔧 Retry / Backoff Settings"):
+        retry_max = st.number_input(
+            "Max retries per stock",
+            min_value=1, max_value=10, value=3, step=1,
+            help="How many times to retry a failed fetch. Default 3 is reliable.",
+            key="sp_retry_max"
+        )
+        retry_initial_delay = st.number_input(
+            "Retry initial delay (sec)",
+            min_value=0.5, max_value=30.0, value=1.0, step=0.5,
+            help="Base delay for exponential backoff on retries. Doubles each retry. Default 1s.",
+            key="sp_retry_delay"
+        )
+        stats_interval = st.number_input(
+            "Stats update every N stocks",
+            min_value=1, max_value=100, value=10, step=1,
+            help="How often the stats bar refreshes during scan. Default every 10 stocks.",
+            key="sp_stats_interval"
+        )
+
+    # Apply retry settings to bulletproof_fetch globals
+    import sys as _sys
+    _cur_mod = _sys.modules.get(__name__, _sys.modules.get('__main__'))
+    if _cur_mod:
+        _cur_mod._RETRY_MAX = retry_max
+        _cur_mod._RETRY_INITIAL_DELAY = retry_initial_delay
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💰 Market Cap Filter")
+    min_market_cap = st.sidebar.slider("Minimum Market Cap (₹ Crores)", 
+        0, 100000, 5000, 1000,
+        help="Filter stocks by minimum market capitalization")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎯 Adjustable Scoring Thresholds")
+
+    with st.sidebar.expander("📊 Customize Score Thresholds", expanded=False):
+        st.markdown("**Qualification Scores:**")
+        threshold_exceptional = st.number_input("Exceptional (≥)", 100, 250, 180, 10)
+        threshold_prime = st.number_input("Prime (≥)", 100, 250, 160, 10)
+        threshold_excellent = st.number_input("Excellent (≥)", 100, 250, 140, 10)
+        threshold_strong = st.number_input("Strong (≥)", 50, 200, 120, 10)
+
+        st.markdown("**Technical Thresholds:**")
+        rsi_low = st.number_input("RSI Lower Bound", 20, 50, 32, 1)
+        rsi_high = st.number_input("RSI Upper Bound", 30, 60, 38, 1)
+
+        st.markdown("**Growth Thresholds:**")
+        min_revenue_yoy = st.number_input("Min Revenue YoY %", 0, 50, 20, 5)
+        min_profit_yoy = st.number_input("Min Profit YoY %", 0, 50, 25, 5)
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎯 ULTRA-STRICT Criteria")
+    st.sidebar.info("""
+    *Only top 1-3% qualify!*
+
+    **TOTAL: 250 Points**
+
+    **Fundamentals (80 pts):**
+    1. Market Cap (15 pts)
+    2. Revenue Growth (25 pts)
+       - YoY ≥20%, QoQ ≥10%
+    3. Profit Growth (25 pts)
+       - YoY ≥25%, QoQ ≥15%
+    4. Profit Margin (15 pts)
+       - ≥15% excellent
+
+    **Technicals (170 pts):**
+    5. FII/DII (20 pts)
+    6. Consolidation (20 pts)
+    7. RSI (20 pts): 32-38
+    8. MACD (15 pts): -1 to +1
+    9. BB (15 pts): 8-20%
+    10. Volume (15 pts): 1.3-1.8x
+    11. Today (10 pts)
+    12. Monthly (10 pts)
+    13. 3-Month (10 pts)
+    14. Upside (10 pts): ≥12%
+
+    **Qualification:**
+    - Exceptional: ≥180 pts
+    - Prime: 160-179 pts
+    - Excellent: 140-159 pts ✅
+    - Strong: 120-139 pts
+    - Below 140: Not qualified
+
+    **Penalties:**
+    - Operated: -70 pts
+    - High Risk: -25 to -40 pts
+    """)
+
+    st.sidebar.markdown("---")
+
+    if 'scan_results' not in st.session_state:
+        st.session_state.scan_results = None
+
+    if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_container_width=True):
+        st.markdown("---")
+        st.subheader("📊 Scanning with Fundamental + Technical Analysis...")
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        stats_placeholder = st.empty()
+
+        results = []
+        total = len(stocks_to_scan)
+        failed = 0
+        filtered_out = 0
+
+        start_time = time.time()
+
+        # SEQUENTIAL PROCESSING ONLY (Best Quality - No Rate Limiting Issues)
+        for idx, symbol in enumerate(stocks_to_scan):
+            status_text.info(f"📊 Analyzing *{symbol}*... ({idx+1}/{total})")
+
+            try:
+                data = fetch_stock_data(symbol)
+                if data:
+                    analysis = analyze_stock(data, min_market_cap, {
+                        'threshold_exceptional': threshold_exceptional,
+                        'threshold_prime': threshold_prime,
+                        'threshold_excellent': threshold_excellent,
+                        'threshold_strong': threshold_strong,
+                        'rsi_low': rsi_low,
+                        'rsi_high': rsi_high,
+                        'min_revenue_yoy': min_revenue_yoy,
+                        'min_profit_yoy': min_profit_yoy
+                    })
+                    if analysis:
+                        results.append(analysis)
+                    else:
+                        filtered_out += 1
+                else:
+                    failed += 1
+            except Exception as e:
                 failed += 1
-        except Exception as e:
-            failed += 1
-        
-        progress = (idx + 1) / total
-        progress_bar.progress(progress)
-        
-        if (idx + 1) % 10 == 0 or idx == total - 1:
-            valid_results_count = len([r for r in results if r is not None])
-            qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
-            stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered(mcap): {filtered_out} | Failed(fetch): {failed} | Processed: {idx+1}/{total}")
-        
-        # Delay between requests - user configurable for best quality
-        time.sleep(request_delay)
-    
-    # Filter out None results before storing
-    results = [r for r in results if r is not None]
-    st.session_state.scan_results = results
-    st.session_state.scan_timestamp = datetime.now()
-    st.session_state.failed_tickers = [stocks_to_scan[i] for i in range(len(stocks_to_scan)) if i >= len(results) + filtered_out][:failed]
-    
-    # Save thresholds to session state
-    st.session_state.threshold_exceptional = threshold_exceptional
-    st.session_state.threshold_prime = threshold_prime
-    st.session_state.threshold_excellent = threshold_excellent
-    st.session_state.threshold_strong = threshold_strong
-    
-    elapsed_time = (time.time() - start_time) / 60  # Convert to minutes
-    
-    # Show completion stats
-    st.success(f"✅ Scan complete! Found {len(results)} stocks meeting market cap criteria")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("✅ Successfully Processed", len(results))
-    col2.metric("❌ Failed", failed)
-    col3.metric("🚫 Filtered Out", filtered_out)
-    col4.metric("⏱️ Time Taken", f"{elapsed_time:.1f} min")
-    
-    # Show failed tickers with retry option
-    if failed > 0 and 'failed_tickers' in st.session_state and st.session_state.failed_tickers:
-        with st.expander(f"⚠️ Failed Tickers ({failed})", expanded=False):
-            st.write(", ".join(st.session_state.failed_tickers[:20]))  # Show first 20
-            if len(st.session_state.failed_tickers) > 20:
-                st.caption(f"...and {len(st.session_state.failed_tickers) - 20} more")
-            
-            if st.button("🔄 Retry Failed Tickers"):
-                with st.spinner("Retrying failed tickers..."):
-                    retry_results = []
-                    for ticker in st.session_state.failed_tickers:
+
+            progress = (idx + 1) / total
+            progress_bar.progress(progress)
+
+            if (idx + 1) % stats_interval == 0 or idx == total - 1:
+                valid_results_count = len([r for r in results if r is not None])
+                qualified_count = len([r for r in results if r is not None and r.get('qualified', False)])
+                stats_placeholder.info(f"✅ Valid: {valid_results_count} | Qualified (≥{threshold_excellent}): {qualified_count} | Filtered: {filtered_out} | Failed: {failed}")
+
+            # Delay between requests - user configurable for best quality
+            time.sleep(request_delay)
+
+            # Batch pause
+            if batch_size_sp > 0 and (idx + 1) % batch_size_sp == 0 and (idx + 1) < total:
+                status_text.warning(f"⏸️ Batch pause: waiting {batch_pause_sp}s after {idx+1} stocks...")
+                time.sleep(batch_pause_sp)
+
+        # Filter out None results before storing
+        results = [r for r in results if r is not None]
+        st.session_state.scan_results = results
+        st.session_state.scan_timestamp = datetime.now()
+        st.session_state.failed_tickers = [stocks_to_scan[i] for i in range(len(stocks_to_scan)) if i >= len(results) + filtered_out][:failed]
+
+        # Save thresholds to session state
+        st.session_state.threshold_exceptional = threshold_exceptional
+        st.session_state.threshold_prime = threshold_prime
+        st.session_state.threshold_excellent = threshold_excellent
+        st.session_state.threshold_strong = threshold_strong
+
+        elapsed_time = (time.time() - start_time) / 60  # Convert to minutes
+
+        # Show completion stats
+        st.success(f"✅ Scan complete! Found {len(results)} stocks meeting market cap criteria")
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("✅ Successfully Processed", len(results))
+        col2.metric("❌ Failed", failed)
+        col3.metric("🚫 Filtered Out", filtered_out)
+        col4.metric("⏱️ Time Taken", f"{elapsed_time:.1f} min")
+
+        # Show failed tickers with retry option
+        if failed > 0 and 'failed_tickers' in st.session_state and st.session_state.failed_tickers:
+            with st.expander(f"⚠️ Failed Tickers ({failed})", expanded=False):
+                st.write(", ".join(st.session_state.failed_tickers[:20]))  # Show first 20
+                if len(st.session_state.failed_tickers) > 20:
+                    st.caption(f"...and {len(st.session_state.failed_tickers) - 20} more")
+
+                if st.button("🔄 Retry Failed Tickers"):
+                    with st.spinner("Retrying failed tickers..."):
+                        retry_results = []
+                        for ticker in st.session_state.failed_tickers:
+                            try:
+                                data = bulletproof_fetch(fetch_stock_data, ticker, max_retries=5)
+                                if data:
+                                    analysis = analyze_stock(data, min_market_cap, {
+                                        'threshold_exceptional': threshold_exceptional,
+                                        'threshold_prime': threshold_prime,
+                                        'threshold_excellent': threshold_excellent,
+                                        'threshold_strong': threshold_strong,
+                                        'rsi_low': rsi_low,
+                                        'rsi_high': rsi_high,
+                                        'min_revenue_yoy': min_revenue_yoy,
+                                        'min_profit_yoy': min_profit_yoy
+                                    })
+                                    if analysis:
+                                        retry_results.append(analysis)
+                            except:
+                                pass
+
+                        if retry_results:
+                            st.session_state.scan_results.extend(retry_results)
+                            st.success(f"✅ Recovered {len(retry_results)} additional stocks!")
+                            time.sleep(1)
+                        else:
+                            st.warning("No additional stocks recovered")
+
+        time.sleep(1)
+        status_text.empty()
+        stats_placeholder.empty()
+        progress_bar.empty()
+
+        st.rerun()
+
+    # Display results
+    if st.session_state.scan_results:
+        results = st.session_state.scan_results
+        scan_time = st.session_state.scan_timestamp
+
+        st.markdown("---")
+
+        # Auto-refresh toggle
+        col_refresh1, col_refresh2, col_refresh3 = st.columns([2, 2, 6])
+
+        with col_refresh1:
+            auto_refresh = st.checkbox("🔄 Auto-refresh prices", value=False, 
+                                       help="Continuously update prices every 30 seconds without resetting")
+
+        with col_refresh2:
+            if 'last_refresh' in st.session_state:
+                seconds_ago = int((datetime.now() - st.session_state.last_refresh).total_seconds())
+                st.caption(f"📡 Updated {seconds_ago}s ago")
+            else:
+                st.caption("📡 Not refreshed yet")
+
+        with col_refresh3:
+            if auto_refresh:
+                if st.button("⏸️ Pause Refresh"):
+                    st.session_state.auto_refresh_paused = True
+                    st.rerun()
+
+        st.subheader(f"📈 Exceptional Stock Opportunities")
+        st.caption(f"Initial scan: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Auto-refresh logic - NON-BLOCKING
+        if auto_refresh and not st.session_state.get('auto_refresh_paused', False):
+            # Initialize refresh counter
+            if 'refresh_counter' not in st.session_state:
+                st.session_state.refresh_counter = 0
+                st.session_state.last_refresh = datetime.now()
+
+            # Check if 30 seconds have passed
+            time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
+
+            if time_since_refresh >= 30:
+                # Update prices in background
+                with st.spinner("🔄 Refreshing live prices..."):
+                    updated_count = 0
+                    for result in results:
+                        # BULLETPROOF: Wrap in try-catch
                         try:
-                            data = bulletproof_fetch(fetch_stock_data, ticker, max_retries=5)
-                            if data:
-                                analysis = analyze_stock(data, min_market_cap, {
-                                    'threshold_exceptional': threshold_exceptional,
-                                    'threshold_prime': threshold_prime,
-                                    'threshold_excellent': threshold_excellent,
-                                    'threshold_strong': threshold_strong,
-                                    'rsi_low': rsi_low,
-                                    'rsi_high': rsi_high,
-                                    'min_revenue_yoy': min_revenue_yoy,
-                                    'min_profit_yoy': min_profit_yoy
-                                })
-                                if analysis:
-                                    retry_results.append(analysis)
+                            new_price = fetch_live_price(result['symbol'])
+                            if new_price and new_price != result['price']:
+                                prev_price = result['price']
+                                result['price'] = new_price
+                                result['change'] = ((new_price - prev_price) / prev_price) * 100 if prev_price != 0 else 0
+                                updated_count += 1
                         except:
                             pass
-                    
-                    if retry_results:
-                        st.session_state.scan_results.extend(retry_results)
-                        st.success(f"✅ Recovered {len(retry_results)} additional stocks!")
-                        time.sleep(1)
-                    else:
-                        st.warning("No additional stocks recovered")
-    
-    time.sleep(1)
-    status_text.empty()
-    stats_placeholder.empty()
-    progress_bar.empty()
-    
-    st.rerun()
 
-# Display results
-if st.session_state.scan_results:
-    results = st.session_state.scan_results
-    scan_time = st.session_state.scan_timestamp
-    
-    st.markdown("---")
-    
-    # Auto-refresh toggle
-    col_refresh1, col_refresh2, col_refresh3 = st.columns([2, 2, 6])
-    
-    with col_refresh1:
-        auto_refresh = st.checkbox("🔄 Auto-refresh prices", value=False, 
-                                   help="Continuously update prices every 30 seconds without resetting")
-    
-    with col_refresh2:
-        if 'last_refresh' in st.session_state:
-            seconds_ago = int((datetime.now() - st.session_state.last_refresh).total_seconds())
-            st.caption(f"📡 Updated {seconds_ago}s ago")
-        else:
-            st.caption("📡 Not refreshed yet")
-    
-    with col_refresh3:
-        if auto_refresh:
-            if st.button("⏸️ Pause Refresh"):
-                st.session_state.auto_refresh_paused = True
+                    st.session_state.last_refresh = datetime.now()
+                    st.session_state.refresh_counter += 1
+
+                    if updated_count > 0:
+                        st.toast(f"✅ Updated {updated_count} prices", icon="🔄")
+
+                # Force re-render
+                time.sleep(1)
                 st.rerun()
-    
-    st.subheader(f"📈 Exceptional Stock Opportunities")
-    st.caption(f"Initial scan: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Auto-refresh logic - NON-BLOCKING
-    if auto_refresh and not st.session_state.get('auto_refresh_paused', False):
-        # Initialize refresh counter
-        if 'refresh_counter' not in st.session_state:
-            st.session_state.refresh_counter = 0
-            st.session_state.last_refresh = datetime.now()
-        
-        # Check if 30 seconds have passed
-        time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
-        
-        if time_since_refresh >= 30:
-            # Update prices in background
-            with st.spinner("🔄 Refreshing live prices..."):
-                updated_count = 0
-                for result in results:
-                    # BULLETPROOF: Wrap in try-catch
-                    try:
-                        new_price = fetch_live_price(result['symbol'])
-                        if new_price and new_price != result['price']:
-                            prev_price = result['price']
-                            result['price'] = new_price
-                            result['change'] = ((new_price - prev_price) / prev_price) * 100 if prev_price != 0 else 0
-                            updated_count += 1
-                    except:
-                        pass
-                
-                st.session_state.last_refresh = datetime.now()
-                st.session_state.refresh_counter += 1
-                
-                if updated_count > 0:
-                    st.toast(f"✅ Updated {updated_count} prices", icon="🔄")
-            
-            # Force re-render
-            time.sleep(1)
-            st.rerun()
-        else:
-            # Schedule next refresh
-            remaining = 30 - time_since_refresh
-            st.info(f"⏱️ Next refresh in {int(remaining)} seconds...")
-            time.sleep(5)  # Check every 5 seconds
-            st.rerun()
-    
-    # Convert to DataFrame - BULLETPROOF: Safe conversions
-    df = pd.DataFrame([{
-        'Symbol': r['symbol'],
-        'Exchange': 'NSE' if '.NS' in r['symbol'] else 'BSE' if '.BO' in r['symbol'] else 'N/A',
-        'Price (₹)': r['price'],
-        'Today (%)': r['change'],
-        'Weekly (%)': r['weekly_change'],
-        'Monthly (%)': r['monthly_change'],
-        '3M (%)': r['three_month_change'],
-        'Market Cap (₹Cr)': r['market_cap'],
-        'Cash/Hand (₹Cr)': r.get('total_cash', 0) / 10000000 if r.get('total_cash') else 0,
-        'CashHand/MCap (%)': r.get('cash_on_hand_to_mcap', 0),
-        'LatestFY Rev/MCap': r.get('latest_fy_revenue_to_mcap', 0),
-        'Rev YoY (%)': r['yoy_revenue_growth'],
-        'Rev QoQ (%)': r['qoq_revenue_growth'],
-        'Profit YoY (%)': r['yoy_profit_growth'],
-        'Profit QoQ (%)': r['qoq_profit_growth'],
-        'Margin (%)': r['profit_margin'],
-        'RSI': r['rsi'],
-        'MACD': r['macd'],
-        'BB (%)': r['bb'],
-        'Vol': f"{r['vol']:.1f}x",
-        'Score': r['score'],
-        'Rating': r['rating'],
-        'Status': r['status'],
-        'Sector': r['sector'],
-        'Operated': '🚨 YES' if r['is_operated'] else '✅ Safe',
-        'Risk': r['operator_risk']
-    } for r in results])
-    
-    # Statistics
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
-    # Get thresholds from session or use defaults
-    threshold_exceptional = st.session_state.get('threshold_exceptional', 180)
-    threshold_prime = st.session_state.get('threshold_prime', 160)
-    threshold_excellent = st.session_state.get('threshold_excellent', 140)
-    threshold_strong = st.session_state.get('threshold_strong', 120)
-    
-    operated_stocks = df[df['Operated'] == '🚨 YES']
-    safe_stocks = df[df['Operated'] == '✅ Safe']
-    exceptional = df[(df['Score'] >= threshold_exceptional) & (df['Operated'] == '✅ Safe')]
-    prime = df[(df['Score'] >= threshold_prime) & (df['Score'] < threshold_exceptional) & (df['Operated'] == '✅ Safe')]
-    excellent = df[(df['Score'] >= threshold_excellent) & (df['Score'] < threshold_prime) & (df['Operated'] == '✅ Safe')]
-    strong = df[(df['Score'] >= threshold_strong) & (df['Score'] < threshold_excellent) & (df['Operated'] == '✅ Safe')]
-    
-    col1.metric("Total Scanned", len(df))
-    col2.metric("🚨 Operated", len(operated_stocks))
-    col3.metric(f"🌟 Exceptional (≥{threshold_exceptional})", len(exceptional))
-    col4.metric(f"🚀 Prime ({threshold_prime}-{threshold_exceptional-1})", len(prime))
-    col5.metric(f"💎 Excellent ({threshold_excellent}-{threshold_prime-1})", len(excellent))
-    col6.metric(f"✅ Strong ({threshold_strong}-{threshold_excellent-1})", len(strong))
-    
-    # Exchange breakdown
-    st.markdown("---")
-    exchange_col1, exchange_col2, exchange_col3 = st.columns(3)
-    nse_stocks = df[df['Exchange'] == 'NSE']
-    bse_stocks = df[df['Exchange'] == 'BSE']
-    
-    exchange_col1.metric("📊 NSE Stocks", len(nse_stocks))
-    exchange_col2.metric("📊 BSE Stocks", len(bse_stocks))
-    exchange_col3.metric("🎯 Qualified (≥140)", len(exceptional) + len(prime) + len(excellent))
-    
-    # Qualification summary
-    qualified_total = len(exceptional) + len(prime) + len(excellent)
-    st.success(f"""
-    **🎯 ULTRA-STRICT RESULTS:** Only **{qualified_total}** stocks qualified (Score ≥140 + Safe) out of {len(df)}.
-    That's the top **{(qualified_total/len(df)*100) if len(df) > 0 else 0:.1f}%** - truly exceptional opportunities with strong fundamentals!
-    """)
-    
-    st.markdown("---")
-    
-    # Filtering
-    st.subheader("🔍 Filter Results")
-    
-    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(5)
-    
-    with filter_col1:
-        rating_filter = st.selectbox("Rating", 
-            ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip"])
-    
-    with filter_col2:
-        exchange_filter = st.selectbox("Exchange",
-            ["All", "NSE", "BSE"])
-    
-    with filter_col3:
-        safety_filter = st.selectbox("Safety", 
-            ["All", "✅ Safe Only", "🚨 Operated Only"])
-    
-    with filter_col4:
-        sector_filter = st.selectbox("Sector", 
-            ["All"] + sorted(df['Sector'].unique().tolist()))
-    
-    with filter_col5:
-        min_score_filter = st.number_input("Min Score", 0, 250, 140, 10,
-                                          help="Default: 140 (Qualified)")
-    
-    # Apply filters
-    filtered_df = df.copy()
-    
-    if rating_filter != "All":
-        filtered_df = filtered_df[filtered_df['Rating'] == rating_filter]
-    
-    if exchange_filter != "All":
-        filtered_df = filtered_df[filtered_df['Exchange'] == exchange_filter]
-    
-    if safety_filter == "✅ Safe Only":
-        filtered_df = filtered_df[filtered_df['Operated'] == '✅ Safe']
-    elif safety_filter == "🚨 Operated Only":
-        filtered_df = filtered_df[filtered_df['Operated'] == '🚨 YES']
-    
-    if sector_filter != "All":
-        filtered_df = filtered_df[filtered_df['Sector'] == sector_filter]
-    
-    filtered_df = filtered_df[filtered_df['Score'] >= min_score_filter]
-    
-    st.info(f"📊 Showing *{len(filtered_df)}* stocks (filtered from {len(df)} total)")
-    
-    # Display table
-    st.subheader("📋 Stock Analysis Table")
-    
-    def highlight_rating(row):
-        if row['Operated'] == '🚨 YES':
-            return ['background-color: #ff6b6b; color: white; font-weight: bold'] * len(row)
-        elif row['Score'] >= 180:
-            return ['background-color: #00e676; color: black; font-weight: bold'] * len(row)
-        elif row['Score'] >= 160:
-            return ['background-color: #69f0ae; font-weight: bold'] * len(row)
-        elif row['Score'] >= 140:
-            return ['background-color: #b9f6ca; font-weight: bold'] * len(row)
-        elif row['Score'] >= 120:
-            return ['background-color: #e1f5fe'] * len(row)
-        elif row['Score'] >= 100:
-            return ['background-color: #fff9c4'] * len(row)
-        else:
-            return ['background-color: #ffebee'] * len(row)
-    
-    styled_df = filtered_df.style.apply(highlight_rating, axis=1)\
-        .format({
-            'Price (₹)': '₹{:.2f}',
-            'Today (%)': '{:+.2f}%',
-            'Weekly (%)': '{:+.2f}%',
-            'Monthly (%)': '{:+.2f}%',
-            '3M (%)': '{:+.2f}%',
-            'Market Cap (₹Cr)': '₹{:.0f}',
-            'Cash/Hand (₹Cr)': '₹{:.0f}',
-            'CashHand/MCap (%)': '{:.2f}%',
-            'LatestFY Rev/MCap': '{:.2f}x',
-            'Rev YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
-            'Rev QoQ (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
-            'Profit YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
-            'Profit QoQ (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
-            'Margin (%)': lambda x: f'{x:.1f}%' if pd.notna(x) else 'N/A',
-            'RSI': '{:.1f}',
-            'MACD': '{:.2f}',
-            'BB (%)': '{:.0f}%'
-        })
-    
-    st.dataframe(styled_df, use_container_width=True, height=600)
-    
-    # Detailed view
-    st.markdown("---")
-    st.subheader("🔍 Detailed Stock Analysis")
-    
-    if len(filtered_df) > 0:
-        selected_symbol = st.selectbox("Select stock for details", filtered_df['Symbol'].tolist())
-        selected_result = next((r for r in results if r['symbol'] == selected_symbol), None)
-        
-        if selected_result:
-            st.markdown(f"### {selected_symbol} - {selected_result['status']}")
-            
-            if selected_result['is_operated']:
-                st.error(f"🚨 **OPERATOR DETECTED** - Risk: {selected_result['operator_risk']}/100")
-                for flag in selected_result['operator_flags']:
-                    st.warning(flag)
-            
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Score", selected_result['score'])
-            col2.metric("Price", f"₹{selected_result['price']:.2f}")
-            col3.metric("Market Cap", f"₹{selected_result['market_cap']:.0f}Cr")
-            col4.metric("Rev YoY", f"{selected_result['yoy_revenue_growth']:+.1f}%" if selected_result['yoy_revenue_growth'] else "N/A")
-            col5.metric("Profit YoY", f"{selected_result['yoy_profit_growth']:+.1f}%" if selected_result['yoy_profit_growth'] else "N/A")
-            
-            # Cash metrics
-            st.markdown("---")
-            st.markdown("**💵 Financial Ratios**")
-            cash_col1, cash_col2, cash_col3 = st.columns(3)
-            cash_col1.metric("Cash on Hand", f"₹{selected_result.get('total_cash', 0)/10000000:.0f}Cr")
-            cash_col2.metric("Cash/MCap Ratio", f"{selected_result.get('cash_on_hand_to_mcap', 0):.2f}%")
-            cash_col3.metric("LatestFY Rev/MCap", f"{selected_result.get('latest_fy_revenue_to_mcap', 0):.2f}x")
-            
-            # 3-YEAR HISTORICAL GRAPHS
-            if selected_result.get('historical_data') and selected_result['historical_data']['years']:
-                st.markdown("---")
-                st.markdown("**📈 3-Year Historical Trends**")
-                
-                historical = selected_result['historical_data']
-                
-                fig = make_subplots(
-                    rows=3, cols=1,
-                    subplot_titles=('YoY Revenue (₹ Cr)', 'Cash Amounts (₹ Cr)', 'Sales to Market Cap Ratio'),
-                    vertical_spacing=0.12
-                )
-                
-                # Revenue graph
-                if historical['revenues']:
-                    fig.add_trace(
-                        go.Bar(
-                            x=historical['years'],
-                            y=[r/10000000 for r in historical['revenues']],
-                            name='Revenue',
-                            marker_color='lightblue',
-                            text=[f"₹{r/10000000:.0f}Cr" for r in historical['revenues']],
-                            textposition='auto'
-                        ),
-                        row=1, col=1
-                    )
-                
-                # Cash graph
-                if historical['cash_amounts']:
-                    fig.add_trace(
-                        go.Bar(
-                            x=historical['years'],
-                            y=[c/10000000 for c in historical['cash_amounts']],
-                            name='Cash',
-                            marker_color='lightgreen',
-                            text=[f"₹{c/10000000:.0f}Cr" for c in historical['cash_amounts']],
-                            textposition='auto'
-                        ),
-                        row=2, col=1
-                    )
-                
-                # Sales to MCap graph
-                if historical['sales_to_mcap']:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=historical['years'],
-                            y=historical['sales_to_mcap'],
-                            name='Sales/MCap',
-                            mode='lines+markers',
-                            line=dict(color='orange', width=3),
-                            marker=dict(size=10),
-                            text=[f"{s:.2f}x" for s in historical['sales_to_mcap']],
-                            textposition='top center'
-                        ),
-                        row=3, col=1
-                    )
-                
-                fig.update_layout(
-                    height=900,
-                    showlegend=False,
-                    title_text=f"{selected_symbol} - 3-Year Financial Trends"
-                )
-                
-                fig.update_yaxes(title_text="Revenue (₹ Cr)", row=1, col=1)
-                fig.update_yaxes(title_text="Cash (₹ Cr)", row=2, col=1)
-                fig.update_yaxes(title_text="Ratio", row=3, col=1)
-                fig.update_xaxes(title_text="Year", row=3, col=1)
-                
-                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("📊 Historical data not available for this stock")
-            
-            st.markdown("---")
-            st.markdown("#### Detailed Scoring Breakdown")
-            for criterion in selected_result['criteria']:
-                if '🚨' in criterion:
-                    st.error(criterion)
-                elif '✅' in criterion:
-                    st.success(criterion)
-                elif '⚠' in criterion:
-                    st.warning(criterion)
+                # Schedule next refresh
+                remaining = 30 - time_since_refresh
+                st.info(f"⏱️ Next refresh in {int(remaining)} seconds...")
+                time.sleep(5)  # Check every 5 seconds
+                st.rerun()
+
+        # Convert to DataFrame - BULLETPROOF: Safe conversions
+        df = pd.DataFrame([{
+            'Symbol': r['symbol'],
+            'Exchange': 'NSE' if '.NS' in r['symbol'] else 'BSE' if '.BO' in r['symbol'] else 'N/A',
+            'Price (₹)': r['price'],
+            'Today (%)': r['change'],
+            'Weekly (%)': r['weekly_change'],
+            'Monthly (%)': r['monthly_change'],
+            '3M (%)': r['three_month_change'],
+            'Market Cap (₹Cr)': r['market_cap'],
+            'Cash/Hand (₹Cr)': r.get('total_cash', 0) / 10000000 if r.get('total_cash') else 0,
+            'CashHand/MCap (%)': r.get('cash_on_hand_to_mcap', 0),
+            'LatestFY Rev/MCap': r.get('latest_fy_revenue_to_mcap', 0),
+            'Rev YoY (%)': r['yoy_revenue_growth'],
+            'Rev QoQ (%)': r['qoq_revenue_growth'],
+            'Profit YoY (%)': r['yoy_profit_growth'],
+            'Profit QoQ (%)': r['qoq_profit_growth'],
+            'Margin (%)': r['profit_margin'],
+            'RSI': r['rsi'],
+            'MACD': r['macd'],
+            'BB (%)': r['bb'],
+            'Vol': f"{r['vol']:.1f}x",
+            'Score': r['score'],
+            'Rating': r['rating'],
+            'Status': r['status'],
+            'Sector': r['sector'],
+            'Operated': '🚨 YES' if r['is_operated'] else '✅ Safe',
+            'Risk': r['operator_risk']
+        } for r in results])
+
+        # Statistics
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+        # Get thresholds from session or use defaults
+        threshold_exceptional = st.session_state.get('threshold_exceptional', 180)
+        threshold_prime = st.session_state.get('threshold_prime', 160)
+        threshold_excellent = st.session_state.get('threshold_excellent', 140)
+        threshold_strong = st.session_state.get('threshold_strong', 120)
+
+        operated_stocks = df[df['Operated'] == '🚨 YES']
+        safe_stocks = df[df['Operated'] == '✅ Safe']
+        exceptional = df[(df['Score'] >= threshold_exceptional) & (df['Operated'] == '✅ Safe')]
+        prime = df[(df['Score'] >= threshold_prime) & (df['Score'] < threshold_exceptional) & (df['Operated'] == '✅ Safe')]
+        excellent = df[(df['Score'] >= threshold_excellent) & (df['Score'] < threshold_prime) & (df['Operated'] == '✅ Safe')]
+        strong = df[(df['Score'] >= threshold_strong) & (df['Score'] < threshold_excellent) & (df['Operated'] == '✅ Safe')]
+
+        col1.metric("Total Scanned", len(df))
+        col2.metric("🚨 Operated", len(operated_stocks))
+        col3.metric(f"🌟 Exceptional (≥{threshold_exceptional})", len(exceptional))
+        col4.metric(f"🚀 Prime ({threshold_prime}-{threshold_exceptional-1})", len(prime))
+        col5.metric(f"💎 Excellent ({threshold_excellent}-{threshold_prime-1})", len(excellent))
+        col6.metric(f"✅ Strong ({threshold_strong}-{threshold_excellent-1})", len(strong))
+
+        # Exchange breakdown
+        st.markdown("---")
+        exchange_col1, exchange_col2, exchange_col3 = st.columns(3)
+        nse_stocks = df[df['Exchange'] == 'NSE']
+        bse_stocks = df[df['Exchange'] == 'BSE']
+
+        exchange_col1.metric("📊 NSE Stocks", len(nse_stocks))
+        exchange_col2.metric("📊 BSE Stocks", len(bse_stocks))
+        exchange_col3.metric("🎯 Qualified (≥140)", len(exceptional) + len(prime) + len(excellent))
+
+        # Qualification summary
+        qualified_total = len(exceptional) + len(prime) + len(excellent)
+        st.success(f"""
+        **🎯 ULTRA-STRICT RESULTS:** Only **{qualified_total}** stocks qualified (Score ≥140 + Safe) out of {len(df)}.
+        That's the top **{(qualified_total/len(df)*100) if len(df) > 0 else 0:.1f}%** - truly exceptional opportunities with strong fundamentals!
+        """)
+
+        st.markdown("---")
+
+        # Filtering
+        st.subheader("🔍 Filter Results")
+
+        filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(5)
+
+        with filter_col1:
+            rating_filter = st.selectbox("Rating", 
+                ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip"])
+
+        with filter_col2:
+            exchange_filter = st.selectbox("Exchange",
+                ["All", "NSE", "BSE"])
+
+        with filter_col3:
+            safety_filter = st.selectbox("Safety", 
+                ["All", "✅ Safe Only", "🚨 Operated Only"])
+
+        with filter_col4:
+            sector_filter = st.selectbox("Sector", 
+                ["All"] + sorted(df['Sector'].unique().tolist()))
+
+        with filter_col5:
+            min_score_filter = st.number_input("Min Score", 0, 250, 140, 10,
+                                              help="Default: 140 (Qualified)")
+
+        # Apply filters
+        filtered_df = df.copy()
+
+        if rating_filter != "All":
+            filtered_df = filtered_df[filtered_df['Rating'] == rating_filter]
+
+        if exchange_filter != "All":
+            filtered_df = filtered_df[filtered_df['Exchange'] == exchange_filter]
+
+        if safety_filter == "✅ Safe Only":
+            filtered_df = filtered_df[filtered_df['Operated'] == '✅ Safe']
+        elif safety_filter == "🚨 Operated Only":
+            filtered_df = filtered_df[filtered_df['Operated'] == '🚨 YES']
+
+        if sector_filter != "All":
+            filtered_df = filtered_df[filtered_df['Sector'] == sector_filter]
+
+        filtered_df = filtered_df[filtered_df['Score'] >= min_score_filter]
+
+        st.info(f"📊 Showing *{len(filtered_df)}* stocks (filtered from {len(df)} total)")
+
+        # Display table
+        st.subheader("📋 Stock Analysis Table")
+
+        def highlight_rating(row):
+            if row['Operated'] == '🚨 YES':
+                return ['background-color: #ff6b6b; color: white; font-weight: bold'] * len(row)
+            elif row['Score'] >= 180:
+                return ['background-color: #00e676; color: black; font-weight: bold'] * len(row)
+            elif row['Score'] >= 160:
+                return ['background-color: #69f0ae; font-weight: bold'] * len(row)
+            elif row['Score'] >= 140:
+                return ['background-color: #b9f6ca; font-weight: bold'] * len(row)
+            elif row['Score'] >= 120:
+                return ['background-color: #e1f5fe'] * len(row)
+            elif row['Score'] >= 100:
+                return ['background-color: #fff9c4'] * len(row)
+            else:
+                return ['background-color: #ffebee'] * len(row)
+
+        styled_df = filtered_df.style.apply(highlight_rating, axis=1)\
+            .format({
+                'Price (₹)': '₹{:.2f}',
+                'Today (%)': '{:+.2f}%',
+                'Weekly (%)': '{:+.2f}%',
+                'Monthly (%)': '{:+.2f}%',
+                '3M (%)': '{:+.2f}%',
+                'Market Cap (₹Cr)': '₹{:.0f}',
+                'Cash/Hand (₹Cr)': '₹{:.0f}',
+                'CashHand/MCap (%)': '{:.2f}%',
+                'LatestFY Rev/MCap': '{:.2f}x',
+                'Rev YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+                'Rev QoQ (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+                'Profit YoY (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+                'Profit QoQ (%)': lambda x: f'{x:+.1f}%' if pd.notna(x) else 'N/A',
+                'Margin (%)': lambda x: f'{x:.1f}%' if pd.notna(x) else 'N/A',
+                'RSI': '{:.1f}',
+                'MACD': '{:.2f}',
+                'BB (%)': '{:.0f}%'
+            })
+
+        st.dataframe(styled_df, use_container_width=True, height=600)
+
+        # Detailed view
+        st.markdown("---")
+        st.subheader("🔍 Detailed Stock Analysis")
+
+        if len(filtered_df) > 0:
+            selected_symbol = st.selectbox("Select stock for details", filtered_df['Symbol'].tolist())
+            selected_result = next((r for r in results if r['symbol'] == selected_symbol), None)
+
+            if selected_result:
+                st.markdown(f"### {selected_symbol} - {selected_result['status']}")
+
+                if selected_result['is_operated']:
+                    st.error(f"🚨 **OPERATOR DETECTED** - Risk: {selected_result['operator_risk']}/100")
+                    for flag in selected_result['operator_flags']:
+                        st.warning(flag)
+
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Score", selected_result['score'])
+                col2.metric("Price", f"₹{selected_result['price']:.2f}")
+                col3.metric("Market Cap", f"₹{selected_result['market_cap']:.0f}Cr")
+                col4.metric("Rev YoY", f"{selected_result['yoy_revenue_growth']:+.1f}%" if selected_result['yoy_revenue_growth'] else "N/A")
+                col5.metric("Profit YoY", f"{selected_result['yoy_profit_growth']:+.1f}%" if selected_result['yoy_profit_growth'] else "N/A")
+
+                # Cash metrics
+                st.markdown("---")
+                st.markdown("**💵 Financial Ratios**")
+                cash_col1, cash_col2, cash_col3 = st.columns(3)
+                cash_col1.metric("Cash on Hand", f"₹{selected_result.get('total_cash', 0)/10000000:.0f}Cr")
+                cash_col2.metric("Cash/MCap Ratio", f"{selected_result.get('cash_on_hand_to_mcap', 0):.2f}%")
+                cash_col3.metric("LatestFY Rev/MCap", f"{selected_result.get('latest_fy_revenue_to_mcap', 0):.2f}x")
+
+                # 3-YEAR HISTORICAL GRAPHS
+                if selected_result.get('historical_data') and selected_result['historical_data']['years']:
+                    st.markdown("---")
+                    st.markdown("**📈 3-Year Historical Trends**")
+
+                    historical = selected_result['historical_data']
+
+                    fig = make_subplots(
+                        rows=3, cols=1,
+                        subplot_titles=('YoY Revenue (₹ Cr)', 'Cash Amounts (₹ Cr)', 'Sales to Market Cap Ratio'),
+                        vertical_spacing=0.12
+                    )
+
+                    # Revenue graph
+                    if historical['revenues']:
+                        fig.add_trace(
+                            go.Bar(
+                                x=historical['years'],
+                                y=[r/10000000 for r in historical['revenues']],
+                                name='Revenue',
+                                marker_color='lightblue',
+                                text=[f"₹{r/10000000:.0f}Cr" for r in historical['revenues']],
+                                textposition='auto'
+                            ),
+                            row=1, col=1
+                        )
+
+                    # Cash graph
+                    if historical['cash_amounts']:
+                        fig.add_trace(
+                            go.Bar(
+                                x=historical['years'],
+                                y=[c/10000000 for c in historical['cash_amounts']],
+                                name='Cash',
+                                marker_color='lightgreen',
+                                text=[f"₹{c/10000000:.0f}Cr" for c in historical['cash_amounts']],
+                                textposition='auto'
+                            ),
+                            row=2, col=1
+                        )
+
+                    # Sales to MCap graph
+                    if historical['sales_to_mcap']:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=historical['years'],
+                                y=historical['sales_to_mcap'],
+                                name='Sales/MCap',
+                                mode='lines+markers',
+                                line=dict(color='orange', width=3),
+                                marker=dict(size=10),
+                                text=[f"{s:.2f}x" for s in historical['sales_to_mcap']],
+                                textposition='top center'
+                            ),
+                            row=3, col=1
+                        )
+
+                    fig.update_layout(
+                        height=900,
+                        showlegend=False,
+                        title_text=f"{selected_symbol} - 3-Year Financial Trends"
+                    )
+
+                    fig.update_yaxes(title_text="Revenue (₹ Cr)", row=1, col=1)
+                    fig.update_yaxes(title_text="Cash (₹ Cr)", row=2, col=1)
+                    fig.update_yaxes(title_text="Ratio", row=3, col=1)
+                    fig.update_xaxes(title_text="Year", row=3, col=1)
+
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.error(criterion)
-    
-    # Download
-    st.markdown("---")
-    st.subheader("💾 Download Results")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        csv = filtered_df.to_csv(index=False)
-        st.download_button(
-            "📥 Download Filtered CSV",
-            csv,
-            f"ultra_strict_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            "text/csv",
-            use_container_width=True
-        )
-    
-    with col2:
-        all_csv = df.to_csv(index=False)
-        st.download_button(
-            "📥 Download All Results CSV",
-            all_csv,
-            f"ultra_strict_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            "text/csv",
-            use_container_width=True
-        )
+                    st.info("📊 Historical data not available for this stock")
 
-else:
-    st.info("👈 Configure and click 'FIND EXCEPTIONAL STOCKS' to start")
-    
-    st.markdown("---")
-    st.subheader("🎯 Why ULTRA-STRICT Works")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("""
-        **NEW: Fundamental Analysis Added!**
-        
-        **4 Fundamental Criteria (80 pts):**
-        1. **Market Cap (15 pts)**
-           - Filters quality companies
-           - Large cap = More stable
-        
-        2. **Revenue Growth (25 pts)**
-           - YoY ≥20% + QoQ ≥10% = 22+ pts
-           - Must show consistent growth
-        
-        3. **Profit Growth (25 pts)**
-           - YoY ≥25% + QoQ ≥15% = 22+ pts
-           - Even stricter than revenue
-        
-        4. **Profit Margin (15 pts)**
-           - ≥15% = Excellent (12+ pts)
-           - Shows business quality
-        
-        **Result:** Only 1-3% stocks pass ALL criteria!
-        """)
-    
-    with col2:
-        st.markdown("""
-        **Complete 14-Point System:**
-        
-        **Fundamentals (80 pts)**
-        - Market cap quality
-        - Revenue acceleration
-        - Profit growth momentum
-        - Margin efficiency
-        
-        **Technicals (170 pts)**
-        - Institutional buying
-        - Perfect consolidation
-        - Oversold RSI (32-38)
-        - MACD crossover
-        - Lower BB bounce
-        - Accumulation volume
-        - Entry timing
-        - Trend confirmation
-        
-        **Safety (Penalties)**
-        - Operator detection: -70 pts
-        - Risk penalties: up to -40 pts
-        """)
-    
-    st.markdown("---")
-    st.error("""
-    **⚠️ ULTRA-STRICT = TOP 1-3% ONLY:**
-    
-    With fundamentals + technicals:
-    - **1-3 stocks** out of 100 qualify (1-3%)
-    - Must have ≥140 points (Perfect fundamentals + technicals)
-    - **0-1 exceptional** (score ≥180)
-    - **1-2 excellent** (score 140-179)
-    
-    **Bottom Line:** We find the absolute BEST opportunities - companies with explosive growth + perfect technical setup!
-    """)
+                st.markdown("---")
+                st.markdown("#### Detailed Scoring Breakdown")
+                for criterion in selected_result['criteria']:
+                    if '🚨' in criterion:
+                        st.error(criterion)
+                    elif '✅' in criterion:
+                        st.success(criterion)
+                    elif '⚠' in criterion:
+                        st.warning(criterion)
+                    else:
+                        st.error(criterion)
 
-st.markdown("---")
-st.markdown("""
-<div style='text-align:center;color:#666;'>
-<p><strong>NSE & BSE Ultra-Strict Scanner with Fundamentals</strong> | Top 1-3% Only</p>
-<p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice.</p>
-</div>
-""", unsafe_allow_html=True)
+        # Download
+        st.markdown("---")
+        st.subheader("💾 Download Results")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            csv = filtered_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Filtered CSV",
+                csv,
+                f"ultra_strict_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+
+        with col2:
+            all_csv = df.to_csv(index=False)
+            st.download_button(
+                "📥 Download All Results CSV",
+                all_csv,
+                f"ultra_strict_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+
+    else:
+        st.info("👈 Configure and click 'FIND EXCEPTIONAL STOCKS' to start")
+
+        st.markdown("---")
+        st.subheader("🎯 Why ULTRA-STRICT Works")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("""
+            **NEW: Fundamental Analysis Added!**
+
+            **4 Fundamental Criteria (80 pts):**
+            1. **Market Cap (15 pts)**
+               - Filters quality companies
+               - Large cap = More stable
+
+            2. **Revenue Growth (25 pts)**
+               - YoY ≥20% + QoQ ≥10% = 22+ pts
+               - Must show consistent growth
+
+            3. **Profit Growth (25 pts)**
+               - YoY ≥25% + QoQ ≥15% = 22+ pts
+               - Even stricter than revenue
+
+            4. **Profit Margin (15 pts)**
+               - ≥15% = Excellent (12+ pts)
+               - Shows business quality
+
+            **Result:** Only 1-3% stocks pass ALL criteria!
+            """)
+
+        with col2:
+            st.markdown("""
+            **Complete 14-Point System:**
+
+            **Fundamentals (80 pts)**
+            - Market cap quality
+            - Revenue acceleration
+            - Profit growth momentum
+            - Margin efficiency
+
+            **Technicals (170 pts)**
+            - Institutional buying
+            - Perfect consolidation
+            - Oversold RSI (32-38)
+            - MACD crossover
+            - Lower BB bounce
+            - Accumulation volume
+            - Entry timing
+            - Trend confirmation
+
+            **Safety (Penalties)**
+            - Operator detection: -70 pts
+            - Risk penalties: up to -40 pts
+            """)
+
+        st.markdown("---")
+        st.error("""
+        **⚠️ ULTRA-STRICT = TOP 1-3% ONLY:**
+
+        With fundamentals + technicals:
+        - **1-3 stocks** out of 100 qualify (1-3%)
+        - Must have ≥140 points (Perfect fundamentals + technicals)
+        - **0-1 exceptional** (score ≥180)
+        - **1-2 excellent** (score 140-179)
+
+        **Bottom Line:** We find the absolute BEST opportunities - companies with explosive growth + perfect technical setup!
+        """)
+
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align:center;color:#666;'>
+    <p><strong>NSE & BSE Ultra-Strict Scanner with Fundamentals</strong> | Top 1-3% Only</p>
+    <p style='font-size:0.85rem;'>⚠ Educational purposes only. Not financial advice.</p>
+    </div>
+    """, unsafe_allow_html=True)
