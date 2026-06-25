@@ -1,17 +1,13 @@
 import streamlit as st
 # ── yf_ratelimit shim ──────────────────────────────────────────
-# Replaces direct yfinance calls with rate-limit-safe wrappers.
-# DO NOT remove this block.
-from yf_ratelimit import safe_ticker as _rl_ticker, safe_download as _rl_download
+from yf_ratelimit import safe_ticker as _rl_ticker
+import threading
 
 class _YFShim:
-    """Makes existing yf.Ticker() / yf.download() calls use safe wrappers."""
+    """Thin shim so existing yf.Ticker() calls use the rate-limit-safe wrapper."""
     @staticmethod
     def Ticker(symbol, **_):
         return _rl_ticker(symbol)
-    @staticmethod
-    def download(tickers, **kwargs):
-        return _rl_download(tickers, **kwargs)
 
 yf = _YFShim()
 # ── end shim ───────────────────────────────────────────────────
@@ -58,37 +54,38 @@ SECTOR_MAP = {
     'JSWSTEEL': 'Metals', 'M&M': 'Auto', 'TECHM': 'IT', 'ADANIENT': 'Conglomerate', 'ADANIPORTS': 'Infrastructure'
 }
 
-# BULLETPROOF: Retry wrapper with exponential backoff
-# max_retries and initial_delay are set by UI controls (see sidebar Rate Limiting section)
-# Defaults: max_retries=3, initial_delay=1 — these work reliably out of the box
+# ── Thread-safe in-memory data cache (replaces @st.cache_data in threaded context) ──
+_DATA_CACHE: dict = {}
+_DATA_CACHE_LOCK = threading.Lock()
+
 _RETRY_MAX = 3
 _RETRY_INITIAL_DELAY = 1
 
 def bulletproof_fetch(func, *args, max_retries=None, initial_delay=None, **kwargs):
-    """Wrapper that adds retry logic with exponential backoff to any function"""
+    """Retry wrapper with exponential backoff. Single sleep per failed attempt."""
     _retries = max_retries if max_retries is not None else _RETRY_MAX
     _delay   = initial_delay if initial_delay is not None else _RETRY_INITIAL_DELAY
     for attempt in range(_retries):
         try:
-            # Add small delay before each attempt to avoid rate limiting
-            if attempt > 0:
-                time.sleep(_delay * (2 ** (attempt - 1)))  # Exponential backoff
             return func(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             if attempt == _retries - 1:
-                # Last attempt failed, return None silently
                 return None
-            # Continue to next attempt
             time.sleep(_delay * (2 ** attempt))
     return None
 
-@st.cache_data(ttl=300)
 def fetch_stock_data(symbol):
-    """Fetch real-time data from Yahoo Finance with fundamentals
-    
-    EXACT structure from original sheshscout.py - simple and clean
-    Symbol comes WITHOUT .NS/.BO, function adds it based on what's in the symbol
+    """Fetch real-time data from Yahoo Finance with fundamentals.
+    Uses a thread-safe in-memory cache (TTL 300s) instead of @st.cache_data,
+    which is not safe to call from inside a ThreadPoolExecutor.
+    Symbol must already include .NS or .BO suffix.
     """
+    # ── Cache check ─────────────────────────────────────────────
+    now = time.time()
+    with _DATA_CACHE_LOCK:
+        entry = _DATA_CACHE.get(symbol)
+        if entry and (now - entry['ts']) < 300:
+            return entry['data']
     try:
         # Symbol already has .NS or .BO added during loading
         ticker = yf.Ticker(symbol)
@@ -202,9 +199,9 @@ def fetch_stock_data(symbol):
         # Calculate timeframe changes - BULLETPROOF: Safe division
         weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] != 0 else 0
         monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 and closes[-20] != 0 else 0
-        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 and closes[0] != 0 else 0
+        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 5 and closes[0] != 0 else 0
         
-        return {
+        result = {
             'symbol': symbol,  # Use the symbol as-is (already has .NS or .BO)
             'price': price,
             'change': change,
@@ -238,6 +235,9 @@ def fetch_stock_data(symbol):
             'qoq_profit_growth': qoq_profit_growth,
             'yoy_profit_growth': yoy_profit_growth
         }
+        with _DATA_CACHE_LOCK:
+            _DATA_CACHE[symbol] = {'ts': time.time(), 'data': result}
+        return result
     except Exception as e:
         return None
 
@@ -539,7 +539,7 @@ def analyze_stock(data, min_market_cap, thresholds=None):
         # Calculate additional indicators - BULLETPROOF: Safe division
         weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] != 0 else 0
         monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 and closes[-20] != 0 else 0
-        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 60 and closes[0] != 0 else 0
+        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 5 and closes[0] != 0 else 0
         
         potential_rs = max(20, price * 0.10)
         potential_pct = (potential_rs / price) * 100 if price != 0 else 0
@@ -575,7 +575,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 7
             criteria.append(f'⚠ Market Cap: Small-Mid Cap (₹{market_cap:.0f} Cr) [7 pts]')
         else:
-            score += 0
             criteria.append(f'❌ Market Cap: Small Cap (₹{market_cap:.0f} Cr) [0 pts]')
         
         # 2. REVENUE GROWTH (25 pts) - NEW! STRICTEST CRITERIA
@@ -599,7 +598,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
                 score += 5
                 criteria.append(f'⚠ Revenue: Moderate Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [5 pts]')
             else:
-                score += 0
                 criteria.append(f'❌ Revenue: Weak/Negative Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [0 pts]')
         elif yoy_rev is not None:
             if yoy_rev >= 20:
@@ -612,10 +610,8 @@ def analyze_stock(data, min_market_cap, thresholds=None):
                 score += 8
                 criteria.append(f'⚠ Revenue: Moderate Growth ({yoy_rev:.1f}%) [8 pts]')
             else:
-                score += 0
                 criteria.append(f'❌ Revenue: Weak Growth ({yoy_rev:.1f}%) [0 pts]')
         else:
-            score += 0
             criteria.append(f'❌ Revenue: Data not available [0 pts]')
         
         # 3. PROFIT GROWTH (25 pts) - NEW! STRICTEST CRITERIA
@@ -640,7 +636,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
                 score += 5
                 criteria.append(f'⚠ Profit: Moderate Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [5 pts]')
             else:
-                score += 0
                 criteria.append(f'❌ Profit: Weak/Negative Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [0 pts]')
         elif yoy_profit is not None:
             if yoy_profit >= 25:
@@ -653,10 +648,8 @@ def analyze_stock(data, min_market_cap, thresholds=None):
                 score += 8
                 criteria.append(f'⚠ Profit: Moderate Growth ({yoy_profit:.1f}%) [8 pts]')
             else:
-                score += 0
                 criteria.append(f'❌ Profit: Weak Growth ({yoy_profit:.1f}%) [0 pts]')
         else:
-            score += 0
             criteria.append(f'❌ Profit: Data not available [0 pts]')
         
         # 4. PROFIT MARGIN (15 pts) - NEW!
@@ -675,10 +668,8 @@ def analyze_stock(data, min_market_cap, thresholds=None):
                 score += 5
                 criteria.append(f'⚠ Profit Margin: Average ({profit_margin_pct:.1f}%) [5 pts]')
             else:
-                score += 0
                 criteria.append(f'❌ Profit Margin: Low ({profit_margin_pct:.1f}%) [0 pts]')
         else:
-            score += 0
             criteria.append(f'❌ Profit Margin: Data not available [0 pts]')
         
         # 5. FII/DII ACTIVITY (20 pts)
@@ -696,7 +687,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 5
             criteria.append(f'⚠ FII/DII: Neutral ({fii_score}) [5 pts]')
         else:
-            score += 0
             criteria.append(f'❌ FII/DII: Selling ({fii_score}) [0 pts]')
         
         # 6. CONSOLIDATION (20 pts)
@@ -710,7 +700,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 15
             criteria.append(f'✅ Consolidation: Early breakout ({weekly_change:+.1f}% weekly) [15 pts]')
         elif weekly_change > 4:
-            score += 0
             criteria.append(f'❌ Already rallied ({weekly_change:+.1f}% weekly) [0 pts]')
         else:
             score += 5
@@ -733,7 +722,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 8
             criteria.append(f'⚠ RSI: Neutral ({rsi:.0f}) [8 pts]')
         elif rsi > rsi_high + 24:
-            score += 0
             criteria.append(f'❌ RSI: Overbought ({rsi:.0f}) [0 pts]')
         else:
             score += 5
@@ -750,7 +738,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 10
             criteria.append(f'✅ MACD: About to turn ({macd:.1f}) [10 pts]')
         elif macd > 6:
-            score += 0
             criteria.append(f'❌ MACD: Extended ({macd:.1f}) [0 pts]')
         else:
             score += 5
@@ -767,7 +754,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 8
             criteria.append(f'⚠ BB: Middle zone ({bb:.0f}%) [8 pts]')
         elif bb > 65:
-            score += 0
             criteria.append(f'❌ BB: Upper band ({bb:.0f}%) [0 pts]')
         else:
             score += 5
@@ -787,7 +773,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 7
             criteria.append(f'⚠ Volume: Average ({vol:.1f}x) [7 pts]')
         else:
-            score += 0
             criteria.append(f'❌ Volume: Too low ({vol:.1f}x) [0 pts]')
         
         # 11. TODAY'S PRICE (10 pts)
@@ -801,7 +786,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 7
             criteria.append(f'⚠ Today: Dip ({change:+.1f}%) [7 pts]')
         elif change > 2.5:
-            score += 0
             criteria.append(f'❌ Today: Already rallied ({change:+.1f}%) [0 pts]')
         else:
             score += 4
@@ -818,7 +802,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 5
             criteria.append(f'⚠ Monthly: Moderate gain ({monthly_change:+.1f}%) [5 pts]')
         elif monthly_change > 10:
-            score += 0
             criteria.append(f'❌ Monthly: Extended ({monthly_change:+.1f}%) [0 pts]')
         else:
             score += 3
@@ -835,7 +818,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 5
             criteria.append(f'⚠ 3-Month: Moderate rise ({three_month_change:+.1f}%) [5 pts]')
         elif three_month_change > 25:
-            score += 0
             criteria.append(f'❌ 3-Month: Overextended ({three_month_change:+.1f}%) [0 pts]')
         else:
             score += 3
@@ -852,7 +834,6 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             score += 5
             criteria.append(f'⚠ Upside: Good ({potential_pct:.1f}%) [5 pts]')
         else:
-            score += 0
             criteria.append(f'❌ Upside: Low ({potential_pct:.1f}%) [0 pts]')
         
         # Rating based on ULTRA-STRICT criteria with ADJUSTABLE thresholds
@@ -909,7 +890,7 @@ def analyze_stock(data, min_market_cap, thresholds=None):
             'rating': rating,
             'criteria': criteria,
             'met_count': met_count,
-            'sector': SECTOR_MAP.get(data['symbol'], 'Other'),
+            'sector': SECTOR_MAP.get(data['symbol'].replace('.NS', '').replace('.BO', ''), 'Other'),
             'is_operated': is_operated,
             'operator_risk': operator_risk,
             'operator_flags': operator_flags,
@@ -1161,12 +1142,7 @@ else:
             key="sp_stats_interval"
         )
 
-    # Apply retry settings to bulletproof_fetch globals
-    import sys as _sys
-    _cur_mod = _sys.modules.get(__name__, _sys.modules.get('__main__'))
-    if _cur_mod:
-        _cur_mod._RETRY_MAX = retry_max
-        _cur_mod._RETRY_INITIAL_DELAY = retry_initial_delay
+    # Retry settings are passed directly to bulletproof_fetch in the scan worker.
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("💰 Market Cap Filter")
@@ -1246,6 +1222,7 @@ else:
         stats_placeholder = st.empty()
 
         results = []
+        failed_symbols = []
         total = len(stocks_to_scan)
         failed = 0
         filtered_out = 0
@@ -1265,11 +1242,13 @@ else:
         }
 
         def _fetch_and_analyze(symbol):
-            """Worker: fetch + analyze one symbol. Returns (symbol, analysis|None, status)"""
+            """Worker: fetch (with retry) + analyze one symbol. Returns (symbol, analysis|None, status)"""
             try:
-                if request_delay > 0:
-                    time.sleep(request_delay)
-                data = fetch_stock_data(symbol)
+                data = bulletproof_fetch(
+                    fetch_stock_data, symbol,
+                    max_retries=retry_max,
+                    initial_delay=retry_initial_delay
+                )
                 if data is None:
                     return symbol, None, 'failed'
                 analysis = analyze_stock(data, min_market_cap, _thresholds)
@@ -1296,6 +1275,12 @@ else:
                     filtered_out += 1
                 else:
                     failed += 1
+                    failed_symbols.append(symbol)
+
+                # Optional batch pause (only when batching is enabled)
+                if batch_size_sp > 0 and completed % batch_size_sp == 0 and completed < total:
+                    status_text.warning(f"⏸ Batch pause {batch_pause_sp}s after {completed} stocks...")
+                    time.sleep(batch_pause_sp)
 
                 progress_bar.progress(completed / total)
 
@@ -1317,7 +1302,7 @@ else:
         results = [r for r in results if r is not None]
         st.session_state.scan_results = results
         st.session_state.scan_timestamp = datetime.now()
-        st.session_state.failed_tickers = [stocks_to_scan[i] for i in range(len(stocks_to_scan)) if i >= len(results) + filtered_out][:failed]
+        st.session_state.failed_tickers = failed_symbols
 
         # Save thresholds to session state
         st.session_state.threshold_exceptional = threshold_exceptional
@@ -1372,7 +1357,7 @@ else:
                         else:
                             st.warning("No additional stocks recovered")
 
-        time.sleep(1)
+        time.sleep(0.3)
         status_text.empty()
         stats_placeholder.empty()
         progress_bar.empty()
@@ -1410,21 +1395,17 @@ else:
         st.caption(f"Initial scan: {scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Auto-refresh logic - NON-BLOCKING
+        # Uses st.empty() + a single conditional rerun, never a blocking sleep loop
         if auto_refresh and not st.session_state.get('auto_refresh_paused', False):
-            # Initialize refresh counter
-            if 'refresh_counter' not in st.session_state:
-                st.session_state.refresh_counter = 0
+            if 'last_refresh' not in st.session_state:
                 st.session_state.last_refresh = datetime.now()
 
-            # Check if 30 seconds have passed
             time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
 
             if time_since_refresh >= 30:
-                # Update prices in background
                 with st.spinner("🔄 Refreshing live prices..."):
                     updated_count = 0
                     for result in results:
-                        # BULLETPROOF: Wrap in try-catch
                         try:
                             new_price = fetch_live_price(result['symbol'])
                             if new_price and new_price != result['price']:
@@ -1432,24 +1413,19 @@ else:
                                 result['price'] = new_price
                                 result['change'] = ((new_price - prev_price) / prev_price) * 100 if prev_price != 0 else 0
                                 updated_count += 1
-                        except:
+                        except Exception:
                             pass
 
                     st.session_state.last_refresh = datetime.now()
-                    st.session_state.refresh_counter += 1
+                    st.session_state.refresh_counter = st.session_state.get('refresh_counter', 0) + 1
 
                     if updated_count > 0:
                         st.toast(f"✅ Updated {updated_count} prices", icon="🔄")
-
-                # Force re-render
-                time.sleep(1)
+                # One rerun after the refresh is done — no sleep before it
                 st.rerun()
             else:
-                # Schedule next refresh
-                remaining = 30 - time_since_refresh
-                st.info(f"⏱️ Next refresh in {int(remaining)} seconds...")
-                time.sleep(5)  # Check every 5 seconds
-                st.rerun()
+                remaining = int(30 - time_since_refresh)
+                st.caption(f"⏱️ Next price refresh in {remaining}s")
 
         # Convert to DataFrame - BULLETPROOF: Safe conversions
         df = pd.DataFrame([{
