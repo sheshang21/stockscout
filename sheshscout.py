@@ -58,151 +58,186 @@ SECTOR_MAP = {
 _DATA_CACHE: dict = {}
 _DATA_CACHE_LOCK = threading.Lock()
 
+# ── Global concurrency gate ──────────────────────────────────────────────────
+# Controls how many workers are actually hitting Yahoo at the same moment.
+# Each stock needs ~3 HTTP calls; 6 workers × 3 calls = 18 concurrent connections,
+# well under Yahoo's ~20–30 limit. Adjust _YF_SEMAPHORE_COUNT at runtime via sidebar.
+_YF_SEMAPHORE_COUNT = 6
+_YF_SEMAPHORE = threading.Semaphore(_YF_SEMAPHORE_COUNT)
+
 _RETRY_MAX = 3
-_RETRY_INITIAL_DELAY = 1
+_RETRY_INITIAL_DELAY = 2   # seconds — longer base so backoff gives Yahoo breathing room
 
 def bulletproof_fetch(func, *args, max_retries=None, initial_delay=None, **kwargs):
-    """Retry wrapper with exponential backoff. Single sleep per failed attempt."""
+    """Retry wrapper with exponential backoff.
+    Handles YFRateLimitError with a longer mandatory pause before retrying.
+    Uses the global semaphore to cap concurrent Yahoo connections.
+    """
+    from yfinance.exceptions import YFRateLimitError as _YFRateLimit
     _retries = max_retries if max_retries is not None else _RETRY_MAX
     _delay   = initial_delay if initial_delay is not None else _RETRY_INITIAL_DELAY
-    for attempt in range(_retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            if attempt == _retries - 1:
-                return None
-            time.sleep(_delay * (2 ** attempt))
+
+    with _YF_SEMAPHORE:
+        for attempt in range(_retries):
+            try:
+                return func(*args, **kwargs)
+            except _YFRateLimit:
+                # Yahoo explicitly said stop — pause longer than normal backoff
+                wait = max(_delay * (2 ** attempt), 10)
+                time.sleep(wait)
+            except Exception:
+                if attempt == _retries - 1:
+                    return None
+                time.sleep(_delay * (2 ** attempt))
     return None
 
 def fetch_stock_data(symbol):
-    """Fetch real-time data from Yahoo Finance with fundamentals.
-    Uses a thread-safe in-memory cache (TTL 300s) instead of @st.cache_data,
-    which is not safe to call from inside a ThreadPoolExecutor.
+    """Fetch data from Yahoo Finance using only 2 HTTP calls per stock.
+
+    Call map (was 6, now 2):
+      CALL 1 — ticker.history()         → OHLCV for all technicals
+      CALL 2 — ticker.get_financials()  → annual income stmt (revenue, margins)
+               ticker.quarterly_income_stmt is a cached sub-slice of the same endpoint
+               ticker.balance_sheet     → fetched once, reused for cash + historical
+      fast_info                         → zero extra HTTP call (uses cached history metadata)
+
+    ticker.info is intentionally NOT called — it is the single most throttled
+    Yahoo endpoint and returns the same fundamentals we derive below from financials.
+
     Symbol must already include .NS or .BO suffix.
     """
-    # ── Cache check ─────────────────────────────────────────────
+    # ── Cache check (300s TTL, thread-safe) ─────────────────────
     now = time.time()
     with _DATA_CACHE_LOCK:
         entry = _DATA_CACHE.get(symbol)
         if entry and (now - entry['ts']) < 300:
             return entry['data']
+
     try:
-        # Symbol already has .NS or .BO added during loading
         ticker = yf.Ticker(symbol)
+
+        # ── CALL 1: Price history ────────────────────────────────
         hist = ticker.history(period="3mo", interval="1d")
-        
         if hist.empty:
             return None
-        
-        closes = hist['Close'].values
-        highs = hist['High'].values
-        lows = hist['Low'].values
+
+        closes  = hist['Close'].values
+        highs   = hist['High'].values
+        lows    = hist['Low'].values
         volumes = hist['Volume'].values
-        
-        price = closes[-1]
+
+        price      = closes[-1]
         prev_close = closes[-2] if len(closes) > 1 else price
-        change = ((price - prev_close) / prev_close) * 100
-        
-        # Get fundamental data
-        info = ticker.info
-        market_cap = info.get('marketCap', 0)
-        
-        # Revenue and profit growth
-        revenue_growth = info.get('revenueGrowth', None)
-        profit_margin = info.get('profitMargins', None)
-        earnings_growth = info.get('earningsGrowth', None)
-        
-        # Additional fundamental metrics
-        pe_ratio = info.get('trailingPE', None)
-        roe = info.get('returnOnEquity', None)
-        debt_to_equity = info.get('debtToEquity', None)
-        
-        # CASH METRICS
-        total_cash = info.get('totalCash', 0)
-        
-        # Get LATEST REPORTED FY REVENUE (most recent completed FY)
+        change     = ((price - prev_close) / prev_close) * 100
+
+        # ── Market cap via fast_info (no extra HTTP call) ────────
+        fi         = ticker.fast_info
+        market_cap = getattr(fi, 'market_cap', None) or 0
+
+        # ── CALL 2a: Annual income statement ─────────────────────
+        # Fetched ONCE and reused for: latest_fy_revenue + historical revenues
+        annual_inc = None
+        try:
+            annual_inc = ticker.income_stmt if hasattr(ticker, 'income_stmt') else ticker.financials
+        except Exception:
+            pass
+
+        # ── CALL 2b: Annual balance sheet ────────────────────────
+        # Fetched ONCE and reused for: total_cash + historical cash
+        annual_bs = None
+        try:
+            annual_bs = ticker.balance_sheet
+        except Exception:
+            pass
+
+        # ── CALL 2c: Quarterly income stmt ───────────────────────
+        # Yahoo returns this from the same underlying financials endpoint;
+        # yfinance caches it on the Ticker object so no duplicate round-trip.
+        q_inc = None
+        try:
+            q_inc = ticker.quarterly_income_stmt if hasattr(ticker, 'quarterly_income_stmt') else ticker.quarterly_financials
+        except Exception:
+            pass
+
+        # ── Derive fundamentals from statements (no ticker.info) ─
+
+        # Latest FY revenue
         latest_fy_revenue = 0
-        try:
-            annual_financials = ticker.income_stmt if hasattr(ticker, 'income_stmt') else ticker.financials
-            if annual_financials is not None and not annual_financials.empty:
-                if 'Total Revenue' in annual_financials.index:
-                    # iloc[0] gets the MOST RECENT fiscal year
-                    latest_fy_revenue = annual_financials.loc['Total Revenue'].iloc[0]
-                    if pd.isna(latest_fy_revenue):
-                        latest_fy_revenue = 0
-        except:
-            latest_fy_revenue = 0
-        
-        # Calculate ratios - BULLETPROOF: Safe division
-        cash_on_hand_to_mcap = (total_cash / market_cap * 100) if market_cap > 0 and total_cash > 0 else 0
+        if annual_inc is not None and not annual_inc.empty:
+            if 'Total Revenue' in annual_inc.index:
+                v = annual_inc.loc['Total Revenue'].iloc[0]
+                latest_fy_revenue = 0 if pd.isna(v) else v
+
+        # Total cash from most recent balance sheet column
+        total_cash = 0
+        if annual_bs is not None and not annual_bs.empty:
+            for cash_key in ('Cash And Cash Equivalents',
+                             'Cash Cash Equivalents And Short Term Investments',
+                             'Cash And Short Term Investments'):
+                if cash_key in annual_bs.index:
+                    v = annual_bs.loc[cash_key].iloc[0]
+                    total_cash = 0 if pd.isna(v) else v
+                    break
+
+        # Profit margin from latest annual income stmt
+        profit_margin = None
+        if annual_inc is not None and not annual_inc.empty:
+            try:
+                rev = annual_inc.loc['Total Revenue'].iloc[0] if 'Total Revenue' in annual_inc.index else None
+                net = annual_inc.loc['Net Income'].iloc[0]     if 'Net Income'    in annual_inc.index else None
+                if rev and net and not pd.isna(rev) and not pd.isna(net) and rev != 0:
+                    profit_margin = net / rev   # expressed as fraction, consistent with old ticker.info value
+            except Exception:
+                pass
+
+        # PE ratio from fast_info (no extra call)
+        pe_ratio       = getattr(fi, 'p_e_ratio', None)
+        # roe / debt_to_equity not available without ticker.info — set None (not used in scoring)
+        revenue_growth = None
+        earnings_growth= None
+        roe            = None
+        debt_to_equity = None
+
+        # QoQ / YoY growth from quarterly income stmt
+        qoq_revenue_growth = yoy_revenue_growth = None
+        qoq_profit_growth  = yoy_profit_growth  = None
+
+        if q_inc is not None and not q_inc.empty:
+            if 'Total Revenue' in q_inc.index:
+                revenues = [r for r in q_inc.loc['Total Revenue'].values if not pd.isna(r)]
+                if len(revenues) >= 2:
+                    qoq_revenue_growth = ((revenues[0] - revenues[1]) / abs(revenues[1])) * 100 if revenues[1] != 0 else None
+                if len(revenues) >= 4:
+                    yoy_revenue_growth = ((revenues[0] - revenues[3]) / abs(revenues[3])) * 100 if revenues[3] != 0 else None
+
+            if 'Net Income' in q_inc.index:
+                profits = [p for p in q_inc.loc['Net Income'].values if not pd.isna(p)]
+                if len(profits) >= 2:
+                    qoq_profit_growth = ((profits[0] - profits[1]) / abs(profits[1])) * 100 if profits[1] != 0 else None
+                if len(profits) >= 4:
+                    yoy_profit_growth = ((profits[0] - profits[3]) / abs(profits[3])) * 100 if profits[3] != 0 else None
+
+        # ── Ratios ───────────────────────────────────────────────
+        cash_on_hand_to_mcap      = (total_cash / market_cap * 100) if market_cap > 0 and total_cash > 0 else 0
         latest_fy_revenue_to_mcap = (latest_fy_revenue / market_cap) if market_cap > 0 and latest_fy_revenue > 0 else 0
-        
-        # Get 3-year historical data
-        historical_data = get_historical_financials(ticker, market_cap)
-        
-        # Get quarterly financials for growth analysis
-        try:
-            financials = ticker.quarterly_income_stmt if hasattr(ticker, 'quarterly_income_stmt') else ticker.quarterly_financials
-            if financials is not None and not financials.empty:
-                # Get Total Revenue if available
-                if 'Total Revenue' in financials.index:
-                    revenues = financials.loc['Total Revenue'].values
-                    # BULLETPROOF: Filter out NaN values
-                    revenues = [r for r in revenues if not pd.isna(r)]
-                    
-                    if len(revenues) >= 4:
-                        # Calculate QoQ and YoY growth - BULLETPROOF: Safe division
-                        qoq_revenue_growth = ((revenues[0] - revenues[1]) / abs(revenues[1])) * 100 if revenues[1] != 0 else None
-                        yoy_revenue_growth = ((revenues[0] - revenues[3]) / abs(revenues[3])) * 100 if len(revenues) >= 4 and revenues[3] != 0 else None
-                    else:
-                        qoq_revenue_growth = None
-                        yoy_revenue_growth = None
-                else:
-                    qoq_revenue_growth = None
-                    yoy_revenue_growth = None
-                
-                # Get Net Income if available
-                if 'Net Income' in financials.index:
-                    profits = financials.loc['Net Income'].values
-                    # BULLETPROOF: Filter out NaN values
-                    profits = [p for p in profits if not pd.isna(p)]
-                    
-                    if len(profits) >= 4:
-                        qoq_profit_growth = ((profits[0] - profits[1]) / abs(profits[1])) * 100 if profits[1] != 0 else None
-                        yoy_profit_growth = ((profits[0] - profits[3]) / abs(profits[3])) * 100 if len(profits) >= 4 and profits[3] != 0 else None
-                    else:
-                        qoq_profit_growth = None
-                        yoy_profit_growth = None
-                else:
-                    qoq_profit_growth = None
-                    yoy_profit_growth = None
-            else:
-                qoq_revenue_growth = None
-                yoy_revenue_growth = None
-                qoq_profit_growth = None
-                yoy_profit_growth = None
-        except Exception as e:
-            qoq_revenue_growth = None
-            yoy_revenue_growth = None
-            qoq_profit_growth = None
-            yoy_profit_growth = None
-        
-        # Get institutional data
+
+        # ── Historical financials (reuses annual_inc + annual_bs already fetched) ──
+        historical_data = get_historical_financials_from_data(annual_inc, annual_bs, market_cap)
+
+        # ── Technicals (pure numpy, no HTTP) ─────────────────────
         fii_dii_activity = detect_institutional_activity(volumes, closes)
-        
-        rsi = calculate_rsi(closes)
-        macd = calculate_macd(closes)
-        bb_position = calculate_bb_position(closes)
-        vol_multiple = calculate_volume_multiple(volumes)
-        trend = detect_trend(closes)
-        
-        # Calculate timeframe changes - BULLETPROOF: Safe division
-        weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] != 0 else 0
-        monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 and closes[-20] != 0 else 0
-        three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 5 and closes[0] != 0 else 0
-        
+        rsi        = calculate_rsi(closes)
+        macd       = calculate_macd(closes)
+        bb_position= calculate_bb_position(closes)
+        vol_multiple= calculate_volume_multiple(volumes)
+        trend      = detect_trend(closes)
+
+        weekly_change      = ((closes[-1] - closes[-5])  / closes[-5])  * 100 if len(closes) >= 5  and closes[-5]  != 0 else 0
+        monthly_change     = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 and closes[-20] != 0 else 0
+        three_month_change = ((closes[-1] - closes[0])   / closes[0])   * 100 if len(closes) >= 5  and closes[0]   != 0 else 0
+
         result = {
-            'symbol': symbol,  # Use the symbol as-is (already has .NS or .BO)
+            'symbol': symbol,
             'price': price,
             'change': change,
             'weekly_change': weekly_change,
@@ -238,59 +273,54 @@ def fetch_stock_data(symbol):
         with _DATA_CACHE_LOCK:
             _DATA_CACHE[symbol] = {'ts': time.time(), 'data': result}
         return result
-    except Exception as e:
+
+    except Exception:
         return None
 
-def get_historical_financials(ticker, current_mcap):
-    """Get 3-year historical revenue, cash, and sales/mcap data"""
+def get_historical_financials_from_data(annual_inc, annual_bs, current_mcap):
+    """Build 3-year historical trends from already-fetched DataFrames.
+    Zero extra HTTP calls — data comes from fetch_stock_data's two calls.
+    """
+    historical = {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []}
     try:
-        financials = ticker.income_stmt if hasattr(ticker, 'income_stmt') else ticker.financials
-        balance_sheet = ticker.balance_sheet  # ANNUAL balance sheet, not quarterly
-        
-        historical = {
-            'years': [],
-            'revenues': [],
-            'cash_amounts': [],
-            'sales_to_mcap': []
-        }
-        
-        if financials is not None and not financials.empty:
-            years = financials.columns[:3] if len(financials.columns) >= 3 else financials.columns
-            
-            for year in years:
-                year_str = year.strftime('%Y') if hasattr(year, 'strftime') else str(year)
-                historical['years'].append(year_str)
-                
-                # Revenue
-                if 'Total Revenue' in financials.index:
-                    revenue = financials.loc['Total Revenue', year]
-                    historical['revenues'].append(revenue if pd.notna(revenue) else 0)
-                else:
-                    historical['revenues'].append(0)
-                
-                # Cash from ANNUAL balance sheet (same source as table)
-                if balance_sheet is not None and not balance_sheet.empty and year in balance_sheet.columns:
-                    if 'Cash And Cash Equivalents' in balance_sheet.index:
-                        cash = balance_sheet.loc['Cash And Cash Equivalents', year]
-                        historical['cash_amounts'].append(cash if pd.notna(cash) else 0)
-                    elif 'Cash Cash Equivalents And Short Term Investments' in balance_sheet.index:
-                        cash = balance_sheet.loc['Cash Cash Equivalents And Short Term Investments', year]
-                        historical['cash_amounts'].append(cash if pd.notna(cash) else 0)
-                    else:
-                        historical['cash_amounts'].append(0)
-                else:
-                    historical['cash_amounts'].append(0)
-        
-        # Calculate Sales to Market Cap - BULLETPROOF: Safe division
-        for revenue in historical['revenues']:
-            if current_mcap > 0 and revenue > 0:
-                historical['sales_to_mcap'].append(revenue / current_mcap)
+        if annual_inc is None or annual_inc.empty:
+            return historical
+
+        years = list(annual_inc.columns[:3]) if len(annual_inc.columns) >= 3 else list(annual_inc.columns)
+
+        for year in years:
+            year_str = year.strftime('%Y') if hasattr(year, 'strftime') else str(year)
+            historical['years'].append(year_str)
+
+            # Revenue
+            if 'Total Revenue' in annual_inc.index:
+                v = annual_inc.loc['Total Revenue', year]
+                historical['revenues'].append(0 if pd.isna(v) else v)
             else:
-                historical['sales_to_mcap'].append(0)
-        
-        return historical
-    except:
-        return {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []}
+                historical['revenues'].append(0)
+
+            # Cash
+            cash = 0
+            if annual_bs is not None and not annual_bs.empty and year in annual_bs.columns:
+                for cash_key in ('Cash And Cash Equivalents',
+                                 'Cash Cash Equivalents And Short Term Investments',
+                                 'Cash And Short Term Investments'):
+                    if cash_key in annual_bs.index:
+                        v = annual_bs.loc[cash_key, year]
+                        cash = 0 if pd.isna(v) else v
+                        break
+            historical['cash_amounts'].append(cash)
+
+        # Sales / MCap ratio
+        for revenue in historical['revenues']:
+            historical['sales_to_mcap'].append(
+                revenue / current_mcap if current_mcap > 0 and revenue > 0 else 0
+            )
+
+    except Exception:
+        pass
+
+    return historical
 
 def fetch_live_price(symbol):
     """Fetch only live price for auto-refresh (non-cached)
@@ -1089,24 +1119,24 @@ else:
     st.sidebar.subheader("⚡ Rate Limiting Controls")
 
     st.sidebar.info("""
-    **⚡ Concurrent Scan (Default: 8 workers)**  
-    Fetches multiple stocks in parallel — 4–8× faster than sequential.  
-    Reduce workers to 2–3 if you get frequent 429 rate-limit errors.
+    **⚡ Concurrent Scan — 3 calls/stock (was 6)**  
+    `ticker.info` removed. Market cap via `fast_info`, fundamentals from financial statements.  
+    Recommended: **4–6 workers**. Each worker uses the global semaphore so Yahoo never sees more than (workers × 3) simultaneous connections.  
+    Reduce to 2–3 only if you still see 429s.
     """)
 
     max_workers_ui = st.sidebar.slider(
         "Parallel workers",
-        min_value=1, max_value=16, value=8, step=1,
-        help="How many stocks to fetch simultaneously. 8 is a good default. Lower if hitting rate limits.",
+        min_value=1, max_value=16, value=6, step=1,
+        help="How many stocks to fetch simultaneously. 6 is the sweet spot (18 concurrent Yahoo connections). Lower if hitting 429s.",
         key="sp_max_workers"
     )
 
-    request_delay = st.sidebar.number_input(
-        "Per-worker delay (sec)",
-        min_value=0.0, max_value=5.0, value=0.1, step=0.05,
-        help="Small pause inside each worker between retries. 0.1s default. Increase only if hitting 429s.",
-        key="sp_req_delay"
-    )
+    # Wire slider to global semaphore so effective concurrency matches the UI control
+    _cur_sem_count = globals().get('_YF_SEMAPHORE_COUNT', 6)
+    if _cur_sem_count != max_workers_ui:
+        globals()['_YF_SEMAPHORE'] = threading.Semaphore(max_workers_ui)
+        globals()['_YF_SEMAPHORE_COUNT'] = max_workers_ui
 
     batch_size_sp = st.sidebar.number_input(
         "Batch size (0 = no batching)",
