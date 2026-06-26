@@ -1035,21 +1035,8 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("🔎 Scan Mode")
 
-_mode_options = ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Slot-wise Scan", "Range Scan", "Custom List"]
-if "scan_mode_selected" not in st.session_state:
-    st.session_state.scan_mode_selected = "Quick Scan (50 stocks)"
-
-for _opt in _mode_options:
-    _checked = st.session_state.scan_mode_selected == _opt
-    if st.sidebar.checkbox(_opt, value=_checked, key=f"scanmode_{_opt}"):
-        if not _checked:
-            st.session_state.scan_mode_selected = _opt
-            st.rerun()
-    elif _checked:
-        # Keep it checked — user must pick another to deselect
-        pass
-
-scan_mode = st.session_state.scan_mode_selected
+scan_mode = st.sidebar.radio("Scan Mode",
+    ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Slot-wise Scan", "Range Scan", "Custom List"])
 
 if scan_mode == "Quick Scan (50 stocks)":
     stocks_to_scan = AVAILABLE_STOCKS[:50]
@@ -1295,6 +1282,11 @@ if 'scan_results' not in st.session_state:
     st.session_state.scan_results = None
 
 if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_container_width=True):
+    # Clear previous results immediately so stale data never shows
+    st.session_state.scan_results = None
+    st.session_state.pop('scan_timestamp', None)
+    st.session_state.pop('failed_tickers', None)
+
     st.markdown("---")
     st.subheader("📊 Scanning with Fundamental + Technical Analysis...")
 
