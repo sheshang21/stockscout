@@ -1033,13 +1033,71 @@ else:
 
 st.sidebar.markdown("---")
 
-scan_mode = st.sidebar.radio("Scan Mode", 
-    ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Slot-wise Scan", "Custom List"])
+st.sidebar.subheader("🔎 Scan Mode")
+
+_mode_options = ["Quick Scan (50 stocks)", "Full Scan (All stocks)", "Slot-wise Scan", "Range Scan", "Custom List"]
+if "scan_mode_selected" not in st.session_state:
+    st.session_state.scan_mode_selected = "Quick Scan (50 stocks)"
+
+for _opt in _mode_options:
+    _checked = st.session_state.scan_mode_selected == _opt
+    if st.sidebar.checkbox(_opt, value=_checked, key=f"scanmode_{_opt}"):
+        if not _checked:
+            st.session_state.scan_mode_selected = _opt
+            st.rerun()
+    elif _checked:
+        # Keep it checked — user must pick another to deselect
+        pass
+
+scan_mode = st.session_state.scan_mode_selected
 
 if scan_mode == "Quick Scan (50 stocks)":
     stocks_to_scan = AVAILABLE_STOCKS[:50]
 elif scan_mode == "Full Scan (All stocks)":
     stocks_to_scan = AVAILABLE_STOCKS
+elif scan_mode == "Range Scan":
+    st.sidebar.subheader("📐 Range Scan Settings")
+    st.sidebar.info("Enter the row range (1-based) from nse.txt / bse.txt to scan.")
+
+    _total_nse = NSE_COUNT if scan_nse else 0
+    _total_bse = BSE_COUNT if scan_bse else 0
+
+    _range_stocks = []
+
+    if scan_nse and _total_nse > 0:
+        st.sidebar.markdown(f"**NSE** — {_total_nse} stocks available")
+        _col1, _col2 = st.sidebar.columns(2)
+        with _col1:
+            _nse_from = st.number_input("NSE From", min_value=1, max_value=_total_nse, value=1, step=1, key="range_nse_from")
+        with _col2:
+            _nse_to = st.number_input("NSE To", min_value=1, max_value=_total_nse, value=min(100, _total_nse), step=1, key="range_nse_to")
+        if _nse_from > _nse_to:
+            st.sidebar.error("NSE 'From' must be ≤ 'To'")
+        else:
+            # AVAILABLE_STOCKS starts with NSE stocks (index 0..NSE_COUNT-1)
+            _nse_slice = [s for s in AVAILABLE_STOCKS if '.NS' in s][(_nse_from - 1):_nse_to]
+            _range_stocks.extend(_nse_slice)
+            st.sidebar.success(f"NSE: rows {_nse_from}–{_nse_to} → {len(_nse_slice)} stocks")
+
+    if scan_bse and _total_bse > 0:
+        st.sidebar.markdown(f"**BSE** — {_total_bse} stocks available")
+        _col3, _col4 = st.sidebar.columns(2)
+        with _col3:
+            _bse_from = st.number_input("BSE From", min_value=1, max_value=_total_bse, value=1, step=1, key="range_bse_from")
+        with _col4:
+            _bse_to = st.number_input("BSE To", min_value=1, max_value=_total_bse, value=min(100, _total_bse), step=1, key="range_bse_to")
+        if _bse_from > _bse_to:
+            st.sidebar.error("BSE 'From' must be ≤ 'To'")
+        else:
+            _bse_slice = [s for s in AVAILABLE_STOCKS if '.BO' in s][(_bse_from - 1):_bse_to]
+            _range_stocks.extend(_bse_slice)
+            st.sidebar.success(f"BSE: rows {_bse_from}–{_bse_to} → {len(_bse_slice)} stocks")
+
+    stocks_to_scan = _range_stocks
+
+    if not stocks_to_scan:
+        st.sidebar.warning("⚠️ No stocks in selected range. Check exchange selection above.")
+
 elif scan_mode == "Slot-wise Scan":
     st.sidebar.subheader("📦 Select Slots to Scan")
 
@@ -1096,7 +1154,7 @@ elif scan_mode == "Slot-wise Scan":
         nse_selected = sum(1 for s in stocks_to_scan if '.NS' in s)
         bse_selected = sum(1 for s in stocks_to_scan if '.BO' in s)
         st.sidebar.success(f"✅ {len(selected_slots)} slot(s) selected\n📊 Total: {len(stocks_to_scan)} stocks\n🔵 NSE: {nse_selected} | 🟠 BSE: {bse_selected}")
-else:
+elif scan_mode == "Custom List":
     custom_input = st.sidebar.text_area("Enter symbols (one per line)", 
         'Stock names with exchange suffix:\nRELIANCE.NS\nTCS.BO\nINFY.NS\n\nOr without (defaults to NSE):\nRELIANCE\nTCS', height=150)
     raw_symbols = [s.strip().upper() for s in custom_input.split('\n') if s.strip()]
@@ -1528,20 +1586,32 @@ if st.session_state.scan_results:
     filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(5)
 
     with filter_col1:
-        rating_filter = st.selectbox("Rating", 
-            ["All", "Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip"])
+        st.markdown("**📊 Rating**")
+        _rating_opts = ["Exceptional Buy", "Prime Buy", "Excellent Buy", "Strong Buy", "Good Buy", "Watchlist", "Skip"]
+        _sel_ratings = [r for r in _rating_opts if st.checkbox(r, value=True, key=f"flt_rating_{r}")]
+        rating_filter = _sel_ratings  # list (empty = show all)
 
     with filter_col2:
-        exchange_filter = st.selectbox("Exchange",
-            ["All", "NSE", "BSE"])
+        st.markdown("**📈 Exchange**")
+        _flt_nse = st.checkbox("NSE", value=True, key="flt_exc_nse")
+        _flt_bse = st.checkbox("BSE", value=True, key="flt_exc_bse")
+        exchange_filter = []
+        if _flt_nse: exchange_filter.append("NSE")
+        if _flt_bse: exchange_filter.append("BSE")
 
     with filter_col3:
-        safety_filter = st.selectbox("Safety", 
-            ["All", "✅ Safe Only", "🚨 Operated Only"])
+        st.markdown("**🛡️ Safety**")
+        _flt_safe = st.checkbox("✅ Safe", value=True, key="flt_safe_safe")
+        _flt_oper = st.checkbox("🚨 Operated", value=False, key="flt_safe_oper")
+        safety_filter = []
+        if _flt_safe: safety_filter.append("✅ Safe")
+        if _flt_oper: safety_filter.append("🚨 Operated")
 
     with filter_col4:
-        sector_filter = st.selectbox("Sector", 
-            ["All"] + sorted(df['Sector'].unique().tolist()))
+        st.markdown("**🏭 Sector**")
+        _all_sectors = sorted(df['Sector'].unique().tolist())
+        _sel_sectors = [s for s in _all_sectors if st.checkbox(s, value=True, key=f"flt_sector_{s}")]
+        sector_filter = _sel_sectors
 
     with filter_col5:
         min_score_filter = st.number_input("Min Score", 0, 250, 140, 10,
@@ -1550,21 +1620,32 @@ if st.session_state.scan_results:
     # Apply filters
     filtered_df = df.copy()
 
-    if rating_filter != "All":
-        filtered_df = filtered_df[filtered_df['Rating'] == rating_filter]
+    if rating_filter:
+        filtered_df = filtered_df[filtered_df['Rating'].isin(rating_filter)]
+    else:
+        filtered_df = filtered_df[filtered_df['Rating'].isin([])]  # nothing selected = empty
 
-    if exchange_filter != "All":
-        filtered_df = filtered_df[filtered_df['Exchange'] == exchange_filter]
+    if exchange_filter:
+        filtered_df = filtered_df[filtered_df['Exchange'].isin(exchange_filter)]
+    else:
+        filtered_df = filtered_df[filtered_df['Exchange'].isin([])]
 
-    if safety_filter == "✅ Safe Only":
-        filtered_df = filtered_df[filtered_df['Operated'] == '✅ Safe']
-    elif safety_filter == "🚨 Operated Only":
-        filtered_df = filtered_df[filtered_df['Operated'] == '🚨 YES']
+    # Safety: map checkbox selections to column values
+    _safety_vals = []
+    if "✅ Safe" in safety_filter: _safety_vals.append("✅ Safe")
+    if "🚨 Operated" in safety_filter: _safety_vals.append("🚨 YES")
+    if _safety_vals:
+        filtered_df = filtered_df[filtered_df['Operated'].isin(_safety_vals)]
+    else:
+        filtered_df = filtered_df[filtered_df['Operated'].isin([])]
 
-    if sector_filter != "All":
-        filtered_df = filtered_df[filtered_df['Sector'] == sector_filter]
+    if sector_filter:
+        filtered_df = filtered_df[filtered_df['Sector'].isin(sector_filter)]
+    else:
+        filtered_df = filtered_df[filtered_df['Sector'].isin([])]
 
     filtered_df = filtered_df[filtered_df['Score'] >= min_score_filter]
+
 
     st.info(f"📊 Showing *{len(filtered_df)}* stocks (filtered from {len(df)} total)")
 
