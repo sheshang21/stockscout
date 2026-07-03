@@ -20,7 +20,43 @@ import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import logging
+import json
+import os
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ── Scan checkpoint (disk-based, survives process restarts) ─────────────
+CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scan_checkpoint.json")
+
+def _universe_signature(symbols):
+    """Fingerprint a stock list so a checkpoint only resumes the same scan."""
+    return hashlib.sha256(",".join(sorted(symbols)).encode()).hexdigest()
+
+def _load_checkpoint():
+    try:
+        with open(CHECKPOINT_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_checkpoint(signature, stocks_to_scan, results, failed_symbols, scanned_symbols):
+    try:
+        with open(CHECKPOINT_PATH, "w") as f:
+            json.dump({
+                "signature": signature,
+                "stocks_to_scan": stocks_to_scan,
+                "results": results,
+                "failed_symbols": failed_symbols,
+                "scanned_symbols": scanned_symbols,
+            }, f)
+    except Exception:
+        pass  # e.g. read-only filesystem -- resume just won't be available
+
+def _clear_checkpoint():
+    try:
+        os.remove(CHECKPOINT_PATH)
+    except Exception:
+        pass
 
 # Configure logging to show warnings but not info
 warnings.filterwarnings('ignore')
@@ -1276,25 +1312,62 @@ st.sidebar.markdown("---")
 if 'scan_results' not in st.session_state:
     st.session_state.scan_results = None
 
-if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_container_width=True):
+_current_signature = _universe_signature(stocks_to_scan)
+_checkpoint = _load_checkpoint()
+_resumable = (
+    _checkpoint is not None
+    and _checkpoint.get("signature") == _current_signature
+    and len(_checkpoint.get("scanned_symbols", [])) < len(stocks_to_scan)
+)
+
+_do_scan = False
+_resume_scan = False
+
+if _resumable:
+    _remaining_n = len(stocks_to_scan) - len(_checkpoint.get("scanned_symbols", []))
+    st.sidebar.info(f"⏸ Interrupted scan found: {_remaining_n} stock(s) left to go")
+    _rcol1, _rcol2 = st.sidebar.columns(2)
+    if _rcol1.button("▶️ RESUME SCAN", type="primary", use_container_width=True):
+        _do_scan = True
+        _resume_scan = True
+    if _rcol2.button("🔄 START FRESH", use_container_width=True):
+        _clear_checkpoint()
+        _do_scan = True
+        _resume_scan = False
+else:
+    if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_container_width=True):
+        _do_scan = True
+        _resume_scan = False
+
+if _do_scan:
     # Clear previous results immediately so stale data never shows
     st.session_state.scan_results = None
     st.session_state.pop('scan_timestamp', None)
     st.session_state.pop('failed_tickers', None)
 
     st.markdown("---")
-    st.subheader("📊 Scanning with Fundamental + Technical Analysis...")
+    if _resume_scan:
+        st.subheader("📊 Resuming scan with Fundamental + Technical Analysis...")
+        results = list(_checkpoint.get("results", []))
+        failed_symbols = list(_checkpoint.get("failed_symbols", []))
+        already_scanned = set(_checkpoint.get("scanned_symbols", []))
+        scan_universe = [s for s in stocks_to_scan if s not in already_scanned]
+    else:
+        st.subheader("📊 Scanning with Fundamental + Technical Analysis...")
+        results = []
+        failed_symbols = []
+        already_scanned = set()
+        scan_universe = list(stocks_to_scan)
+        _clear_checkpoint()
 
     progress_bar = st.progress(0)
     status_text = st.empty()
     stats_placeholder = st.empty()
 
-    results = []
-    failed_symbols = []
     total = len(stocks_to_scan)
-    failed = 0
+    failed = len(failed_symbols)
     filtered_out = 0
-    completed = 0
+    completed = len(already_scanned)
 
     start_time = time.time()
 
@@ -1327,44 +1400,59 @@ if st.sidebar.button("🚀 FIND EXCEPTIONAL STOCKS", type="primary", use_contain
             return symbol, None, 'failed'
 
     # ── CONCURRENT SCAN ──────────────────────────────────────────────────
-    _max_workers = min(max_workers_ui, total)
-    status_text.info(f"⚡ Concurrent scan: {_max_workers} workers × {total} stocks")
+    _max_workers = min(max_workers_ui, len(scan_universe)) if scan_universe else 1
+    status_text.info(f"⚡ Concurrent scan: {_max_workers} workers × {len(scan_universe)} stocks remaining")
 
-    with ThreadPoolExecutor(max_workers=_max_workers) as executor:
-        future_to_sym = {executor.submit(_fetch_and_analyze, sym): sym for sym in stocks_to_scan}
+    _scan_interrupted = False
+    try:
+        with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+            future_to_sym = {executor.submit(_fetch_and_analyze, sym): sym for sym in scan_universe}
 
-        for future in as_completed(future_to_sym):
-            symbol, analysis, status = future.result()
-            completed += 1
+            for future in as_completed(future_to_sym):
+                symbol, analysis, status = future.result()
+                completed += 1
+                already_scanned.add(symbol)
 
-            if status == 'ok':
-                results.append(analysis)
-            elif status == 'filtered':
-                filtered_out += 1
-            else:
-                failed += 1
-                failed_symbols.append(symbol)
+                if status == 'ok':
+                    results.append(analysis)
+                elif status == 'filtered':
+                    filtered_out += 1
+                else:
+                    failed += 1
+                    failed_symbols.append(symbol)
 
-            # Optional batch pause (only when batching is enabled)
-            if batch_size_sp > 0 and completed % batch_size_sp == 0 and completed < total:
-                status_text.warning(f"⏸ Batch pause {batch_pause_sp}s after {completed} stocks...")
-                time.sleep(batch_pause_sp)
+                # Checkpoint after every stock so a crash/restart loses nothing
+                _save_checkpoint(_current_signature, stocks_to_scan, results, failed_symbols, list(already_scanned))
 
-            progress_bar.progress(completed / total)
+                # Optional batch pause (only when batching is enabled)
+                if batch_size_sp > 0 and completed % batch_size_sp == 0 and completed < total:
+                    status_text.warning(f"⏸ Batch pause {batch_pause_sp}s after {completed} stocks...")
+                    time.sleep(batch_pause_sp)
 
-            if completed % stats_interval == 0 or completed == total:
-                qualified_count = sum(1 for r in results if r.get('qualified', False))
-                elapsed = (time.time() - start_time)
-                rate = completed / elapsed if elapsed > 0 else 0
-                eta = (total - completed) / rate if rate > 0 else 0
-                status_text.info(
-                    f"📊 {completed}/{total} done · ✅ {len(results)} valid · "
-                    f"🎯 {qualified_count} qualified · ⏱ ETA {eta:.0f}s"
-                )
-                stats_placeholder.info(
-                    f"✅ Valid: {len(results)} | Qualified (≥{threshold_excellent}): {qualified_count} "
-                    f"| Filtered: {filtered_out} | Failed: {failed}"
-                )
+                progress_bar.progress(completed / total)
+
+                if completed % stats_interval == 0 or completed == total:
+                    qualified_count = sum(1 for r in results if r.get('qualified', False))
+                    elapsed = (time.time() - start_time)
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    eta = (total - completed) / rate if rate > 0 else 0
+                    status_text.info(
+                        f"📊 {completed}/{total} done · ✅ {len(results)} valid · "
+                        f"🎯 {qualified_count} qualified · ⏱ ETA {eta:.0f}s"
+                    )
+                    stats_placeholder.info(
+                        f"✅ Valid: {len(results)} | Qualified (≥{threshold_excellent}): {qualified_count} "
+                        f"| Filtered: {filtered_out} | Failed: {failed}"
+                    )
+    except Exception as e:
+        _scan_interrupted = True
+        st.error(f"⚠️ Scan interrupted: {e}. Progress up to this point is saved — click ▶️ RESUME SCAN to continue.")
+
+    if _scan_interrupted:
+        st.stop()
+
+    # Full universe completed — checkpoint no longer needed
+    _clear_checkpoint()
 
     # Filter out None results before storing
     results = [r for r in results if r is not None]
