@@ -70,9 +70,10 @@ import yfinance as yf
 # ────────────────────────────────────────────────────────────────────────────
 MIN_DELAY_S      = 0.8    # minimum pause between Yahoo requests
 MAX_DELAY_S      = 2.5    # maximum pause (random jitter)
-MAX_RETRIES      = 5      # retry budget per call
+MAX_RETRIES      = 3      # retry budget per call (was 5 -- see cooldown note below)
 BASE_BACKOFF_S   = 3.0    # base for exponential backoff on 429
 CACHE_TTL_S      = 3600   # in-process cache TTL (1 hour)
+COOLDOWN_S       = 20.0   # shared pause applied to ALL threads after any 429
 _CHROME_UA       = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -84,16 +85,38 @@ _CHROME_UA       = (
 # ────────────────────────────────────────────────────────────────────────────
 _gate_lock       = threading.Lock()
 _last_request_ts = 0.0
+_cooldown_until  = 0.0   # monotonic timestamp; all threads wait until this passes
 
 def _throttle():
-    """Block until at least MIN_DELAY_S has elapsed since the last call."""
+    """Block until at least MIN_DELAY_S has elapsed since the last call,
+    AND until any active shared cooldown (see _trigger_cooldown) has expired.
+    """
     global _last_request_ts
     with _gate_lock:
-        now   = time.monotonic()
-        wait  = MIN_DELAY_S - (now - _last_request_ts)
+        now = time.monotonic()
+        if now < _cooldown_until:
+            time.sleep(_cooldown_until - now)
+            now = time.monotonic()
+        wait = MIN_DELAY_S - (now - _last_request_ts)
         if wait > 0:
             time.sleep(wait)
         _last_request_ts = time.monotonic()
+
+
+def _trigger_cooldown(seconds: float = COOLDOWN_S):
+    """Called by any thread that hits a real 429. Pushes _cooldown_until
+    forward so every other thread's next _throttle() call also pauses --
+    instead of 6 threads independently backing off and retrying into each
+    other, they all go quiet together and come back once, staggered by the
+    normal MIN_DELAY_S gate. This is what actually stops the retry storm
+    that used to cascade into an 80+ minute stall.
+    """
+    global _cooldown_until
+    with _gate_lock:
+        target = time.monotonic() + seconds
+        if target > _cooldown_until:
+            _cooldown_until = target
+    logger.warning("yf_ratelimit: 429 detected -- cooling down ALL threads for %.0fs", seconds)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -193,6 +216,7 @@ def _with_retry(fn, *args, **kwargs):
                 # Non-rate-limit error — don't keep retrying
                 raise
             logger.warning("yf_ratelimit: rate-limit hit on attempt %d: %s", attempt + 1, exc)
+            _trigger_cooldown()  # tell every other thread to back off too
 
     raise last_exc or RuntimeError("yf_ratelimit: all retries exhausted")
 
