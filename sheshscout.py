@@ -62,12 +62,20 @@ def _clear_checkpoint():
 # A delisted symbol still triggers yf_ratelimit's full internal retry ladder
 # (up to 5 attempts x growing backoff) on every fresh scan/restart, which is
 # what stalled the app long enough for Streamlit's health check to time out.
-# Once we see a definitive "no data" for a symbol, remember it on disk and
-# skip the network call entirely next time (entries expire after 30 days,
-# in case a halted stock relists).
+#
+# CAUTION: yfinance returns an empty history() DataFrame both for a truly
+# delisted symbol AND for a symbol that got caught in a shared rate-limit
+# burst -- there's no way to tell those apart from a single empty result.
+# So we require TWO empty results, at least an hour apart, before treating a
+# symbol as dead. A one-off rate-limit burst (many symbols empty at once,
+# all within seconds of each other) will not trigger a blacklist; only a
+# symbol that's *still* empty on a later, separate scan will.
+# Entries expire after 30 days in case a halted stock relists.
 DEAD_SYMBOLS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dead_symbols.json")
 _DEAD_SYMBOLS_TTL = 30 * 24 * 3600
-_DEAD_SYMBOLS_CACHE = None
+_DEAD_STRIKE_MIN_GAP = 3600      # seconds between strikes for them to count separately
+_DEAD_STRIKE_THRESHOLD = 2       # strikes needed before a symbol is treated as dead
+_DEAD_SYMBOLS_CACHE = None       # symbol -> list of strike timestamps
 _DEAD_SYMBOLS_LOCK = threading.Lock()
 
 def _load_dead_symbols():
@@ -75,7 +83,12 @@ def _load_dead_symbols():
         with open(DEAD_SYMBOLS_PATH, "r") as f:
             data = json.load(f)
         now = time.time()
-        return {s: ts for s, ts in data.items() if now - ts < _DEAD_SYMBOLS_TTL}
+        cleaned = {}
+        for s, strikes in data.items():
+            strikes = [t for t in strikes if now - t < _DEAD_SYMBOLS_TTL]
+            if strikes:
+                cleaned[s] = strikes
+        return cleaned
     except Exception:
         return {}
 
@@ -84,17 +97,30 @@ def _is_known_dead(symbol):
     with _DEAD_SYMBOLS_LOCK:
         if _DEAD_SYMBOLS_CACHE is None:
             _DEAD_SYMBOLS_CACHE = _load_dead_symbols()
-        return symbol in _DEAD_SYMBOLS_CACHE
+        return len(_DEAD_SYMBOLS_CACHE.get(symbol, [])) >= _DEAD_STRIKE_THRESHOLD
 
 def _mark_dead_symbol(symbol):
     global _DEAD_SYMBOLS_CACHE
     with _DEAD_SYMBOLS_LOCK:
         if _DEAD_SYMBOLS_CACHE is None:
             _DEAD_SYMBOLS_CACHE = _load_dead_symbols()
-        _DEAD_SYMBOLS_CACHE[symbol] = time.time()
+        strikes = _DEAD_SYMBOLS_CACHE.get(symbol, [])
+        now = time.time()
+        if not strikes or (now - strikes[-1]) >= _DEAD_STRIKE_MIN_GAP:
+            strikes.append(now)
+            _DEAD_SYMBOLS_CACHE[symbol] = strikes
+            try:
+                with open(DEAD_SYMBOLS_PATH, "w") as f:
+                    json.dump(_DEAD_SYMBOLS_CACHE, f)
+            except Exception:
+                pass
+
+def _clear_dead_symbols():
+    global _DEAD_SYMBOLS_CACHE
+    with _DEAD_SYMBOLS_LOCK:
+        _DEAD_SYMBOLS_CACHE = {}
         try:
-            with open(DEAD_SYMBOLS_PATH, "w") as f:
-                json.dump(_DEAD_SYMBOLS_CACHE, f)
+            os.remove(DEAD_SYMBOLS_PATH)
         except Exception:
             pass
 
@@ -1355,6 +1381,14 @@ st.sidebar.info("""
 """)
 
 st.sidebar.markdown("---")
+
+_dead_count = len(_load_dead_symbols())
+if _dead_count > 0:
+    if st.sidebar.button(f"🧹 Clear skip-list ({_dead_count} symbols)", use_container_width=True,
+                          help="Symbols the scanner is currently skipping as 'dead'. Clear this if results look too low — a rate-limit burst can wrongly flag valid symbols."):
+        _clear_dead_symbols()
+        st.sidebar.success("Skip-list cleared")
+        st.rerun()
 
 if 'scan_results' not in st.session_state:
     st.session_state.scan_results = None
