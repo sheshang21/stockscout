@@ -58,6 +58,46 @@ def _clear_checkpoint():
     except Exception:
         pass
 
+# ── Known-dead symbol cache (delisted / not-found) ───────────────────────
+# A delisted symbol still triggers yf_ratelimit's full internal retry ladder
+# (up to 5 attempts x growing backoff) on every fresh scan/restart, which is
+# what stalled the app long enough for Streamlit's health check to time out.
+# Once we see a definitive "no data" for a symbol, remember it on disk and
+# skip the network call entirely next time (entries expire after 30 days,
+# in case a halted stock relists).
+DEAD_SYMBOLS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dead_symbols.json")
+_DEAD_SYMBOLS_TTL = 30 * 24 * 3600
+_DEAD_SYMBOLS_CACHE = None
+_DEAD_SYMBOLS_LOCK = threading.Lock()
+
+def _load_dead_symbols():
+    try:
+        with open(DEAD_SYMBOLS_PATH, "r") as f:
+            data = json.load(f)
+        now = time.time()
+        return {s: ts for s, ts in data.items() if now - ts < _DEAD_SYMBOLS_TTL}
+    except Exception:
+        return {}
+
+def _is_known_dead(symbol):
+    global _DEAD_SYMBOLS_CACHE
+    with _DEAD_SYMBOLS_LOCK:
+        if _DEAD_SYMBOLS_CACHE is None:
+            _DEAD_SYMBOLS_CACHE = _load_dead_symbols()
+        return symbol in _DEAD_SYMBOLS_CACHE
+
+def _mark_dead_symbol(symbol):
+    global _DEAD_SYMBOLS_CACHE
+    with _DEAD_SYMBOLS_LOCK:
+        if _DEAD_SYMBOLS_CACHE is None:
+            _DEAD_SYMBOLS_CACHE = _load_dead_symbols()
+        _DEAD_SYMBOLS_CACHE[symbol] = time.time()
+        try:
+            with open(DEAD_SYMBOLS_PATH, "w") as f:
+                json.dump(_DEAD_SYMBOLS_CACHE, f)
+        except Exception:
+            pass
+
 # Configure logging to show warnings but not info
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.WARNING)
@@ -135,6 +175,10 @@ def fetch_stock_data(symbol):
 
     Symbol must already include .NS or .BO suffix.
     """
+    # ── Known-dead short-circuit (no network call at all) ────────
+    if _is_known_dead(symbol):
+        return None
+
     # ── Cache check (300s TTL, thread-safe) ─────────────────────
     now = time.time()
     with _DATA_CACHE_LOCK:
@@ -148,6 +192,7 @@ def fetch_stock_data(symbol):
         # ── CALL 1: Price history ────────────────────────────────
         hist = ticker.history(period="3mo", interval="1d")
         if hist.empty:
+            _mark_dead_symbol(symbol)
             return None
 
         closes  = hist['Close'].values
@@ -303,7 +348,9 @@ def fetch_stock_data(symbol):
             _DATA_CACHE[symbol] = {'ts': time.time(), 'data': result}
         return result
 
-    except Exception:
+    except Exception as e:
+        if any(kw in str(e).lower() for kw in ("delisted", "not found", "no data found")):
+            _mark_dead_symbol(symbol)
         return None
 
 def get_historical_financials_from_data(annual_inc, annual_bs, current_mcap):
