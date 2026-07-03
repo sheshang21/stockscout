@@ -67,27 +67,22 @@ _RETRY_MAX = 3
 _RETRY_INITIAL_DELAY = 2   # seconds — longer base so backoff gives Yahoo breathing room
 
 def bulletproof_fetch(func, *args, max_retries=None, initial_delay=None, **kwargs):
-    """Retry wrapper with exponential backoff.
-    Handles YFRateLimitError with a longer mandatory pause before retrying.
-    Uses the global semaphore to cap concurrent Yahoo connections.
-    """
-    from yfinance.exceptions import YFRateLimitError as _YFRateLimit
-    _retries = max_retries if max_retries is not None else _RETRY_MAX
-    _delay   = initial_delay if initial_delay is not None else _RETRY_INITIAL_DELAY
+    """Single-shot wrapper around a Yahoo-calling function.
 
+    IMPORTANT: yf_ratelimit.py's _CachedTicker already retries every individual
+    Yahoo call up to MAX_RETRIES times with its own exponential backoff before
+    raising. Retrying the *whole* fetch_stock_data() call again here on top of
+    that used to multiply delays (outer_retries x inner_retries) while holding
+    a worker slot the entire time -- that compounding was what caused scans to
+    stall for 80+ minutes under real rate-limiting. So: call once, catch, and
+    bail. The semaphore is only held for the single attempt, never across a
+    sleep/backoff, so a slow/stuck symbol can't starve the other workers.
+    """
     with _YF_SEMAPHORE:
-        for attempt in range(_retries):
-            try:
-                return func(*args, **kwargs)
-            except _YFRateLimit:
-                # Yahoo explicitly said stop — pause longer than normal backoff
-                wait = max(_delay * (2 ** attempt), 10)
-                time.sleep(wait)
-            except Exception:
-                if attempt == _retries - 1:
-                    return None
-                time.sleep(_delay * (2 ** attempt))
-    return None
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            return None
 
 def fetch_stock_data(symbol):
     """Fetch data from Yahoo Finance using only 2 HTTP calls per stock.
