@@ -74,6 +74,25 @@ MAX_RETRIES      = 3      # retry budget per call (was 5 -- see cooldown note be
 BASE_BACKOFF_S   = 3.0    # base for exponential backoff on 429
 CACHE_TTL_S      = 3600   # in-process cache TTL (1 hour)
 COOLDOWN_S       = 20.0   # shared pause applied to ALL threads after any 429
+
+def configure(max_retries: int | None = None, base_backoff: float | None = None,
+              min_delay: float | None = None, cooldown: float | None = None) -> None:
+    """Let callers (the Streamlit UI's Retry/Backoff sliders) actually change
+    retry behaviour at runtime. Previously the UI sliders for this existed
+    but were never wired to anything real -- every call silently used the
+    hardcoded MAX_RETRIES/BASE_BACKOFF_S above regardless of what the sidebar
+    said. This makes those controls do what they claim to do.
+    Safe to call at the start of every scan (cheap global reassignment).
+    """
+    global MAX_RETRIES, BASE_BACKOFF_S, MIN_DELAY_S, COOLDOWN_S
+    if max_retries is not None:
+        MAX_RETRIES = max(1, int(max_retries))
+    if base_backoff is not None:
+        BASE_BACKOFF_S = max(0.1, float(base_backoff))
+    if min_delay is not None:
+        MIN_DELAY_S = max(0.05, float(min_delay))
+    if cooldown is not None:
+        COOLDOWN_S = max(1.0, float(cooldown))
 _CHROME_UA       = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
