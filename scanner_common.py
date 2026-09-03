@@ -35,6 +35,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Iterable
@@ -560,6 +561,7 @@ def run_scan(mode_key: str, stocks_to_scan: list,
     progress_bar = st.progress(0)
     status_text = st.empty()
     stats_placeholder = st.empty()
+    live_status = st.empty()
 
     total = len(stocks_to_scan)
     failed = len(failed_records)
@@ -579,6 +581,49 @@ def run_scan(mode_key: str, stocks_to_scan: list,
     _checkpoint_every = max(1, total // 100 if total else 1)
     _last_checkpoint_ts = time.time()
 
+    # Rolling "what just happened" feed for the live-status panel below.
+    # Previously the only visibility into a running scan was the aggregate
+    # progress bar + a periodic (every stats_interval-th stock) stats line --
+    # every 429 / cooldown / retry yf_ratelimit hits only went to the server
+    # log (invisible in the app itself, and on Streamlit Cloud only reachable
+    # by opening the separate log viewer). This surfaces both per-symbol
+    # outcomes and yf_ratelimit's own rate-limit events inside the app,
+    # updating live as the scan runs.
+    _recent_completions: "deque[dict]" = deque(maxlen=10)
+    _last_live_update = 0.0
+
+    def _render_live_status(force: bool = False):
+        nonlocal _last_live_update
+        now = time.time()
+        if not force and (now - _last_live_update) < 0.35:
+            return
+        _last_live_update = now
+
+        yf_status = yf_ratelimit.get_status()
+        lines = []
+        if yf_status["cooldown_active"]:
+            lines.append(f"🧊 **Cooling down** — all workers paused for another "
+                         f"{yf_status['cooldown_remaining']:.0f}s (Yahoo rate limit)")
+        lines.append(f"🔌 {yf_status['inflight']} request(s) in flight · {max_workers} workers configured")
+
+        if _recent_completions:
+            lines.append("")
+            lines.append("**Recently completed:**")
+            for item in reversed(_recent_completions):
+                lines.append(f"&nbsp;&nbsp;{item['icon']} `{item['symbol']}` — {item['label']}")
+
+        events = yf_ratelimit.get_recent_events(6)
+        if events:
+            lines.append("")
+            lines.append("**Rate-limit activity:**")
+            for ev in reversed(events):
+                age = now - ev["ts"]
+                lines.append(f"&nbsp;&nbsp;{ev['message']} _{age:.0f}s ago_")
+
+        live_status.markdown("\n\n".join(lines))
+
+    _render_live_status(force=True)
+
     scan_interrupted = False
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -596,9 +641,13 @@ def run_scan(mode_key: str, stocks_to_scan: list,
 
                 if status == "ok" and analysis is not None:
                     results.append(analysis)
+                    _recent_completions.append({"symbol": rec["symbol"], "icon": "✅", "label": "qualified"})
                 elif status == "failed":
                     failed += 1
                     failed_records.append(rec["yf_symbol"])
+                    _recent_completions.append({"symbol": rec["symbol"], "icon": "❌", "label": "failed"})
+                else:
+                    _recent_completions.append({"symbol": rec["symbol"], "icon": "⏭️", "label": "filtered out"})
                 # 'filtered' -> counted implicitly (completed - len(results) - failed)
 
                 _now = time.time()
@@ -606,6 +655,8 @@ def run_scan(mode_key: str, stocks_to_scan: list,
                         or (_now - _last_checkpoint_ts) >= 5):
                     save_checkpoint(mode_key, signature, stocks_to_scan, results, failed_records, list(already_scanned))
                     _last_checkpoint_ts = _now
+
+                _render_live_status(force=(completed == total))
 
                 if rate_cfg["batch_size"] > 0 and completed % rate_cfg["batch_size"] == 0 and completed < total:
                     status_text.warning(f"⏸ Batch pause {rate_cfg['batch_pause']}s after {completed} stocks...")

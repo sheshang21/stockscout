@@ -127,6 +127,57 @@ _gate_lock       = threading.Lock()
 _last_request_ts = 0.0
 _cooldown_until  = 0.0   # monotonic timestamp; all threads wait until this passes
 
+# ────────────────────────────────────────────────────────────────────────────
+# LIVE STATUS  (for the app UI, not just server logs)
+# ────────────────────────────────────────────────────────────────────────────
+# Everything below used to only reach a Python logger.warning() -- fine for
+# grepping Streamlit Cloud's server log viewer after the fact, but invisible
+# in the app itself while a scan is running. scanner_common's live-status
+# panel polls this during a scan so 429s/cooldowns/retries show up in the UI
+# in real time, not just in a log file the user has to go copy-paste out.
+from collections import deque
+
+_EVENT_LOG_MAX = 200
+_event_log: "deque[dict]" = deque(maxlen=_EVENT_LOG_MAX)
+_event_lock = threading.Lock()
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+
+def _log_event(message: str, level: str = "info") -> None:
+    with _event_lock:
+        _event_log.append({"ts": time.time(), "level": level, "message": message})
+
+
+def get_recent_events(n: int = 15) -> list[dict]:
+    """Most recent rate-limit-level events (429s, cooldowns, empty-response
+    retries), oldest first. For display in the app's live-status panel."""
+    with _event_lock:
+        return list(_event_log)[-n:]
+
+
+def clear_events() -> None:
+    with _event_lock:
+        _event_log.clear()
+
+
+def get_status() -> dict:
+    """Snapshot of the shared rate-limit gate, for a live status widget:
+    is a cooldown active right now (and for how much longer), and how many
+    Yahoo requests are actually in flight across all worker threads."""
+    now = time.monotonic()
+    with _gate_lock:
+        cooldown_remaining = max(0.0, _cooldown_until - now)
+    with _inflight_lock:
+        inflight = _inflight
+    return {
+        "cooldown_active": cooldown_remaining > 0,
+        "cooldown_remaining": cooldown_remaining,
+        "inflight": inflight,
+        "min_delay_s": MIN_DELAY_S,
+    }
+
+
 def _throttle():
     """Block until at least MIN_DELAY_S has elapsed since the last call,
     AND until any active shared cooldown (see _trigger_cooldown) has expired.
@@ -165,6 +216,7 @@ def _trigger_cooldown(seconds: float | None = None):
         if target > _cooldown_until:
             _cooldown_until = target
     logger.warning("yf_ratelimit: 429 detected -- cooling down ALL threads for %.0fs", seconds)
+    _log_event(f"🧊 Cooling down all workers for {seconds:.0f}s", "cooldown")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -280,6 +332,7 @@ def _with_retry(fn, *args, **kwargs):
     Call fn(*args, **kwargs) with throttle + exponential backoff on errors.
     Returns the result or raises the last exception after MAX_RETRIES.
     """
+    global _inflight
     last_exc = None
     for attempt in range(MAX_RETRIES):
         _throttle()
@@ -288,7 +341,10 @@ def _with_retry(fn, *args, **kwargs):
             backoff = BASE_BACKOFF_S * (2 ** (attempt - 1)) + jitter
             logger.warning("yf_ratelimit: retry %d/%d — waiting %.1fs",
                            attempt, MAX_RETRIES, backoff)
+            _log_event(f"⏳ Retry {attempt}/{MAX_RETRIES} — waiting {backoff:.1f}s", "retry")
             time.sleep(backoff)
+        with _inflight_lock:
+            _inflight += 1
         try:
             result = fn(*args, **kwargs)
             # yf.download returns a DataFrame; empty == likely rate-limited.
@@ -302,6 +358,7 @@ def _with_retry(fn, *args, **kwargs):
             # rate-limit into a scan-wide crawl.
             if isinstance(result, pd.DataFrame) and result.empty and attempt < MAX_RETRIES - 1:
                 logger.warning("yf_ratelimit: empty DataFrame on attempt %d — retrying", attempt + 1)
+                _log_event(f"⚠️ Empty response (attempt {attempt + 1}) — possible silent throttle", "warning")
                 last_exc = RuntimeError("Empty DataFrame returned (possible silent 429)")
                 _trigger_cooldown()
                 continue
@@ -314,7 +371,12 @@ def _with_retry(fn, *args, **kwargs):
                 # Non-rate-limit error — don't keep retrying
                 raise
             logger.warning("yf_ratelimit: rate-limit hit on attempt %d: %s", attempt + 1, exc)
+            _log_event(f"🚫 429 rate limit (attempt {attempt + 1}/{MAX_RETRIES})", "warning")
             _trigger_cooldown()  # tell every other thread to back off too
+        finally:
+            with _inflight_lock:
+                _inflight -= 1
+
 
     raise last_exc or RuntimeError("yf_ratelimit: all retries exhausted")
 
