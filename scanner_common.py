@@ -35,7 +35,6 @@ import json
 import os
 import threading
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Iterable
@@ -581,16 +580,17 @@ def run_scan(mode_key: str, stocks_to_scan: list,
     _checkpoint_every = max(1, total // 100 if total else 1)
     _last_checkpoint_ts = time.time()
 
-    # Rolling "what just happened" feed for the live-status panel below.
-    # Previously the only visibility into a running scan was the aggregate
-    # progress bar + a periodic (every stats_interval-th stock) stats line --
-    # every 429 / cooldown / retry yf_ratelimit hits only went to the server
-    # log (invisible in the app itself, and on Streamlit Cloud only reachable
-    # by opening the separate log viewer). This surfaces both per-symbol
-    # outcomes and yf_ratelimit's own rate-limit events inside the app,
-    # updating live as the scan runs.
-    _recent_completions: "deque[dict]" = deque(maxlen=10)
+    # Live-status panel below. Previously the only visibility into a running
+    # scan was the aggregate progress bar + a periodic (every stats_interval-th
+    # stock) stats line -- every 429 / cooldown / retry yf_ratelimit hits only
+    # went to the server log (invisible in the app itself, and on Streamlit
+    # Cloud only reachable by opening the separate log viewer). This surfaces
+    # yf_ratelimit's rate-limit events inside the app, updating live as the
+    # scan runs -- kept to a single current-status line rather than a growing
+    # per-symbol list, since most stocks get filtered out by design and an
+    # itemized log of that is just noise, not "live status."
     _last_live_update = 0.0
+    _last_symbol = {"symbol": None, "icon": "", "label": ""}
 
     def _render_live_status(force: bool = False):
         nonlocal _last_live_update
@@ -606,13 +606,10 @@ def run_scan(mode_key: str, stocks_to_scan: list,
                          f"{yf_status['cooldown_remaining']:.0f}s (Yahoo rate limit)")
         lines.append(f"🔌 {yf_status['inflight']} request(s) in flight · {max_workers} workers configured")
 
-        if _recent_completions:
-            lines.append("")
-            lines.append("**Recently completed:**")
-            for item in reversed(_recent_completions):
-                lines.append(f"&nbsp;&nbsp;{item['icon']} `{item['symbol']}` — {item['label']}")
+        if _last_symbol["symbol"]:
+            lines.append(f"{_last_symbol['icon']} Last: `{_last_symbol['symbol']}` — {_last_symbol['label']}")
 
-        events = yf_ratelimit.get_recent_events(6)
+        events = yf_ratelimit.get_recent_events(4)
         if events:
             lines.append("")
             lines.append("**Rate-limit activity:**")
@@ -641,13 +638,13 @@ def run_scan(mode_key: str, stocks_to_scan: list,
 
                 if status == "ok" and analysis is not None:
                     results.append(analysis)
-                    _recent_completions.append({"symbol": rec["symbol"], "icon": "✅", "label": "qualified"})
+                    _last_symbol.update(symbol=rec["symbol"], icon="✅", label="qualified")
                 elif status == "failed":
                     failed += 1
                     failed_records.append(rec["yf_symbol"])
-                    _recent_completions.append({"symbol": rec["symbol"], "icon": "❌", "label": "failed"})
+                    _last_symbol.update(symbol=rec["symbol"], icon="❌", label="failed")
                 else:
-                    _recent_completions.append({"symbol": rec["symbol"], "icon": "⏭️", "label": "filtered out"})
+                    _last_symbol.update(symbol=rec["symbol"], icon="⏭️", label="filtered out")
                 # 'filtered' -> counted implicitly (completed - len(results) - failed)
 
                 _now = time.time()
