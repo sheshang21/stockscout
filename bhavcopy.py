@@ -150,16 +150,17 @@ def _fetch_nse_day(day: date) -> "pd.DataFrame | None":
     https://www.nseindia.com/all-reports if this URL stops resolving --
     NSE has moved this before (bhavcopy.nse -> archives.nse -> nsearchives)."""
     ddmmyyyy = day.strftime("%d%m%Y")
+    referer = "https://www.nseindia.com/all-reports"
     url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
     try:
         sess = _get_session()
         try:
             # NSE's anti-bot layer generally wants a prior hit to the site
             # root to pick up cookies before serving archive files.
-            sess.get("https://www.nseindia.com", timeout=_REQUEST_TIMEOUT_S)
+            sess.get(referer, timeout=_REQUEST_TIMEOUT_S)
         except Exception:
             pass
-        resp = sess.get(url, timeout=_REQUEST_TIMEOUT_S)
+        resp = sess.get(url, timeout=_REQUEST_TIMEOUT_S, headers={"Referer": referer})
         if resp.status_code != 200 or not resp.content:
             return None
         df = pd.read_csv(io.BytesIO(resp.content))
@@ -190,14 +191,21 @@ def _fetch_nse_day(day: date) -> "pd.DataFrame | None":
 def _fetch_bse_day(day: date) -> "pd.DataFrame | None":
     """BSE's full bhavcopy for one trading day, keyed by numeric scrip code
     (matches the ".BO" root tickers.py already uses). BSE has changed this
-    endpoint/format more often than NSE historically -- treat it as the
-    less reliable of the two; any failure here just falls back to
-    yfinance same as an NSE failure would."""
+    endpoint/format more often than NSE historically, and — like NSE — 403s
+    bare requests that don't look like a browser that actually visited the
+    site: a warm-up GET to the bhavcopy page (for cookies) plus a Referer
+    header pointing at it, same pattern NSE needs. Any failure here just
+    falls back to yfinance same as an NSE failure would."""
     ddmmyy = day.strftime("%d%m%y")
+    referer = "https://www.bseindia.com/markets/marketinfo/BhavCopy.aspx"
     url = f"https://www.bseindia.com/download/BhavCopy/Equity/EQ{ddmmyy}_CSV.ZIP"
     try:
         sess = _get_session()
-        resp = sess.get(url, timeout=_REQUEST_TIMEOUT_S)
+        try:
+            sess.get(referer, timeout=_REQUEST_TIMEOUT_S)
+        except Exception:
+            pass
+        resp = sess.get(url, timeout=_REQUEST_TIMEOUT_S, headers={"Referer": referer})
         if resp.status_code != 200 or not resp.content:
             return None
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
