@@ -113,8 +113,11 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-MIN_DELAY_S      = _env_float("YF_MIN_DELAY_S", 1.1)     # minimum pause between Yahoo requests
-MAX_DELAY_S      = _env_float("YF_MAX_DELAY_S", 3.2)     # maximum pause (random jitter)
+MIN_DELAY_S      = _env_float("YF_MIN_DELAY_S", 1.5)     # minimum pause between Yahoo requests
+                          # (was 1.1 -- bumped as extra margin on 2026-09-03 alongside the
+                          # throttle fix itself, since the 1.1s figure was never actually
+                          # being enforced in production until now)
+MAX_DELAY_S      = _env_float("YF_MAX_DELAY_S", 4.0)     # maximum pause (random jitter)
 MAX_RETRIES      = _env_int("YF_MAX_RETRIES", 3)         # retry budget per call
 BASE_BACKOFF_S   = _env_float("YF_BASE_BACKOFF_S", 4.0)  # base for exponential backoff on 429
 CACHE_TTL_S      = _env_int("YF_CACHE_TTL_S", 3600)      # in-process cache TTL (seconds)
