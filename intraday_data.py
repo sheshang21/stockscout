@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
+import bhavcopy
 import scanner_common as sc
 from scanner_common import yf
 
@@ -38,14 +39,30 @@ def fetch_intraday_snapshot(yf_symbol: str):
 
     try:
         ticker = yf.Ticker(yf_symbol)
+        # 1-minute intraday bars have no free public source for NSE/BSE, so
+        # this one call stays on yfinance no matter what — see bhavcopy.py's
+        # module docstring for why.
         intraday = ticker.history(period="1d", interval="1m")
-        daily = ticker.history(period="5d", interval="1d")
 
-        if intraday.empty or daily.empty:
+        # The plain 5-day *daily* reference bars ARE ordinary EOD data, so
+        # try NSE/BSE's own bhavcopy first — zero Yahoo calls when it has
+        # data — and only fall back to yfinance if it doesn't.
+        bhav = bhavcopy.get_latest_daily(yf_symbol, n=5)
+        if bhav is not None:
+            daily_close = bhav["close"].values.astype(float)
+            daily_volume = bhav["volume"].values.astype(float)
+            daily_is_empty = False
+        else:
+            daily = ticker.history(period="5d", interval="1d")
+            daily_close = daily["Close"].values.astype(float)
+            daily_volume = daily["Volume"].values.astype(float)
+            daily_is_empty = daily.empty
+
+        if intraday.empty or daily_is_empty:
             # Empty daily history on a >5-day-old symbol is a real dead signal;
             # an empty *intraday* frame can just mean market's closed right
             # now, so only mark dead when the daily history is also empty.
-            if daily.empty:
+            if daily_is_empty:
                 sc.mark_dead_symbol(yf_symbol)
             return None
 
@@ -58,8 +75,8 @@ def fetch_intraday_snapshot(yf_symbol: str):
             "intraday_volume": intraday["Volume"].values.astype(float),
             "day_high": float(intraday["High"].max()),
             "day_low": float(intraday["Low"].min()),
-            "daily_close": daily["Close"].values.astype(float),
-            "daily_volume": daily["Volume"].values.astype(float),
+            "daily_close": daily_close,
+            "daily_volume": daily_volume,
         }
         sc.cache_set(cache_key, snapshot)
         return snapshot

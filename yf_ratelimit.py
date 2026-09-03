@@ -32,6 +32,19 @@ HUGGING FACE SPACES NOTES
   Add to requirements.txt:  curl_cffi>=0.6.2
 • The module auto-falls-back to requests if curl_cffi is absent.
 • No secrets or env-vars required — works out of the box.
+
+IF YOU'RE STILL GETTING 429s WITH ALL OF THE ABOVE IN PLACE
+--------------------------------------------------------------
+Everything above (curl_cffi impersonation, backoff, shared cooldown,
+caching) only controls how politely THIS process talks to Yahoo. It
+can't fix Yahoo throttling the IP itself, which on Streamlit Cloud's
+free tier is shared across many unrelated apps' traffic, not just
+yours. If 429s persist with sensible MIN_DELAY_S/COOLDOWN_S values,
+the remaining lever is a proxy so Yahoo sees a different IP:
+    export YF_HTTP_PROXY="http://user:pass@host:port"
+or call `configure(proxy="http://user:pass@host:port")` once at
+startup. Unset by default — this is opt-in and requires your own
+proxy provider, nothing here calls out anywhere unless you set one.
 """
 
 from __future__ import annotations
@@ -97,15 +110,28 @@ REQUEST_TIMEOUT_S = 15.0  # hard ceiling on any single HTTP call to Yahoo -- see
                           # happen to accumulate before every worker thread is occupied.
 
 def configure(max_retries: int | None = None, base_backoff: float | None = None,
-              min_delay: float | None = None, cooldown: float | None = None) -> None:
+              min_delay: float | None = None, cooldown: float | None = None,
+              proxy: str | None = None) -> None:
     """Let callers (the Streamlit UI's Retry/Backoff sliders) actually change
     retry behaviour at runtime. Previously the UI sliders for this existed
     but were never wired to anything real -- every call silently used the
     hardcoded MAX_RETRIES/BASE_BACKOFF_S above regardless of what the sidebar
     said. This makes those controls do what they claim to do.
     Safe to call at the start of every scan (cheap global reassignment).
+
+    proxy: an http(s) proxy URL (e.g. "http://user:pass@host:port"), or ""
+    to clear one. Every backoff/cooldown tuning in this file only changes
+    HOW POLITELY this process retries against Yahoo -- it can't help if
+    Yahoo has throttled the shared Streamlit Cloud egress IP itself, which
+    is the actual cause of most 429s once curl_cffi + backoff are already
+    in place (see the KEY LIMITATION note below _get_thread_session). A
+    proxy is the one lever that actually changes which IP Yahoo sees. No
+    proxy is configured by default -- this is opt-in and costs nothing to
+    leave unset. New sessions pick up the change; existing per-thread
+    sessions are cleared so the new proxy takes effect on their next call
+    rather than only for new threads.
     """
-    global MAX_RETRIES, BASE_BACKOFF_S, MIN_DELAY_S, COOLDOWN_S
+    global MAX_RETRIES, BASE_BACKOFF_S, MIN_DELAY_S, COOLDOWN_S, _PROXY_URL
     if max_retries is not None:
         MAX_RETRIES = max(1, int(max_retries))
     if base_backoff is not None:
@@ -114,6 +140,30 @@ def configure(max_retries: int | None = None, base_backoff: float | None = None,
         MIN_DELAY_S = max(0.05, float(min_delay))
     if cooldown is not None:
         COOLDOWN_S = max(1.0, float(cooldown))
+    if proxy is not None:
+        _PROXY_URL = proxy.strip() or None
+        _reset_thread_sessions()
+# Optional outbound proxy -- see configure()'s proxy= param above for why
+# this is the one lever that actually helps once backoff/cooldown/curl_cffi
+# are already in place. Unset by default; can be set via configure(proxy=...)
+# or the YF_HTTP_PROXY / HTTPS_PROXY / HTTP_PROXY env vars at process start.
+_PROXY_URL: str | None = (
+    os.environ.get("YF_HTTP_PROXY")
+    or os.environ.get("HTTPS_PROXY")
+    or os.environ.get("HTTP_PROXY")
+    or None
+)
+_session_version = 0  # bumped by _reset_thread_sessions() so existing
+                       # per-thread sessions rebuild themselves (with the
+                       # new proxy) on their next call, instead of only
+                       # affecting threads created after configure() runs.
+
+
+def _reset_thread_sessions() -> None:
+    global _session_version
+    _session_version += 1
+
+
 _CHROME_UA       = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -237,7 +287,8 @@ _thread_local = threading.local()
 
 def _get_thread_session():
     sess = getattr(_thread_local, "session", None)
-    if sess is not None:
+    cached_version = getattr(_thread_local, "session_version", None)
+    if sess is not None and cached_version == _session_version:
         return sess
 
     if _HAS_CURL:
@@ -256,6 +307,11 @@ def _get_thread_session():
         )
         sess.mount("https://", HTTPAdapter(max_retries=retry))
         sess.mount("http://",  HTTPAdapter(max_retries=retry))
+
+    if _PROXY_URL:
+        # curl_cffi and requests both accept the same {"http":..,"https":..}
+        # shape on .proxies.
+        sess.proxies = {"http": _PROXY_URL, "https": _PROXY_URL}
 
     sess.headers.update({
         "User-Agent":      _CHROME_UA,
@@ -278,6 +334,7 @@ def _get_thread_session():
 
     sess.request = _request_with_timeout
     _thread_local.session = sess
+    _thread_local.session_version = _session_version
     return sess
 
 
@@ -492,9 +549,11 @@ _registry_lock   = threading.Lock()
 # file, the platform is still running an old build.
 logger.warning(
     "yf_ratelimit CONFIG: MIN_DELAY_S=%.1f MAX_DELAY_S=%.1f COOLDOWN_S=%.1f "
-    "BASE_BACKOFF_S=%.1f REQUEST_TIMEOUT_S=%.1f TICKER_REGISTRY_MAX=%d MEM_CACHE_MAX=%d",
+    "BASE_BACKOFF_S=%.1f REQUEST_TIMEOUT_S=%.1f TICKER_REGISTRY_MAX=%d MEM_CACHE_MAX=%d "
+    "PROXY=%s",
     MIN_DELAY_S, MAX_DELAY_S, COOLDOWN_S, BASE_BACKOFF_S, REQUEST_TIMEOUT_S,
     _TICKER_REGISTRY_MAX, _MEM_CACHE_MAX,
+    "configured" if _PROXY_URL else "none (set YF_HTTP_PROXY or call configure(proxy=...) to add one)",
 )
 
 def safe_ticker(symbol: str) -> _CachedTicker:

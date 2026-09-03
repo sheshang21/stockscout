@@ -19,6 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import bhavcopy
 import indicators
 import scanner_common as sc
 from scanner_common import sskey, get_state, set_state, yf
@@ -39,10 +40,16 @@ _CACHE_TTL_S = 300  # fundamentals barely move intraday; long TTL is fine and ke
 
 # ── CORE LOGIC: fetch ────────────────────────────────────────────────────
 def fetch_stock_data(yf_symbol: str):
-    """2 HTTP calls per stock: history() for technicals, financials/balance
-    sheet for fundamentals. ticker.info is intentionally never called — it's
-    the most throttled Yahoo endpoint and everything here is derivable from
-    the financial statements + fast_info instead."""
+    """History for technicals comes from NSE/BSE's own bhavcopy first (see
+    bhavcopy.py) — it's free EOD data with no Yahoo rate limit attached, so
+    using it removes this call from Yahoo's load entirely instead of just
+    retrying it more politely. Falls back to yfinance's ticker.history() if
+    bhavcopy has no usable data for this symbol (unrecognized exchange
+    suffix, a fetch failure, or too little history). Financials/balance
+    sheet still come from yfinance — bhavcopy has no such data. ticker.info
+    is intentionally never called — it's the most throttled Yahoo endpoint
+    and everything here is derivable from the financial statements +
+    fast_info instead."""
     if sc.is_known_dead(yf_symbol):
         return None
 
@@ -54,15 +61,21 @@ def fetch_stock_data(yf_symbol: str):
     try:
         ticker = yf.Ticker(yf_symbol)
 
-        hist = ticker.history(period="3mo", interval="1d")
-        if hist.empty:
-            sc.mark_dead_symbol(yf_symbol)
-            return None
-
-        closes = hist['Close'].values
-        highs = hist['High'].values
-        lows = hist['Low'].values
-        volumes = hist['Volume'].values
+        bhav = bhavcopy.get_daily_series(yf_symbol, trading_days=65)
+        if bhav is not None:
+            closes = bhav['close'].values
+            highs = bhav['high'].values
+            lows = bhav['low'].values
+            volumes = bhav['volume'].values
+        else:
+            hist = ticker.history(period="3mo", interval="1d")
+            if hist.empty:
+                sc.mark_dead_symbol(yf_symbol)
+                return None
+            closes = hist['Close'].values
+            highs = hist['High'].values
+            lows = hist['Low'].values
+            volumes = hist['Volume'].values
 
         price = closes[-1]
         prev_close = closes[-2] if len(closes) > 1 else price
