@@ -42,6 +42,7 @@ import os
 import random
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 import pandas as pd
@@ -65,15 +66,35 @@ except ImportError:
 
 import yfinance as yf
 
+logger.warning("yf_ratelimit: curl_cffi available = %s (install curl_cffi if False -- "
+                "the single biggest fix for Streamlit Cloud / HF Spaces 429s)", _HAS_CURL)
+
 # ────────────────────────────────────────────────────────────────────────────
 # CONFIG  (tune here if needed)
 # ────────────────────────────────────────────────────────────────────────────
-MIN_DELAY_S      = 0.8    # minimum pause between Yahoo requests
-MAX_DELAY_S      = 2.5    # maximum pause (random jitter)
-MAX_RETRIES      = 3      # retry budget per call (was 5 -- see cooldown note below)
-BASE_BACKOFF_S   = 3.0    # base for exponential backoff on 429
+MIN_DELAY_S      = 1.1    # minimum pause between Yahoo requests (bumped from 0.8 --
+                          # Streamlit Cloud's free-tier egress IP is shared across many
+                          # other apps, so it gets throttled harder than a dedicated IP)
+MAX_DELAY_S      = 3.2    # maximum pause (random jitter)
+MAX_RETRIES      = 3      # retry budget per call
+BASE_BACKOFF_S   = 4.0    # base for exponential backoff on 429 (bumped from 3.0)
 CACHE_TTL_S      = 3600   # in-process cache TTL (1 hour)
-COOLDOWN_S       = 20.0   # shared pause applied to ALL threads after any 429
+COOLDOWN_S       = 35.0   # shared pause applied to ALL threads after any 429 OR a
+                          # silent empty-response block (bumped from 20.0 -- see the
+                          # empty-DataFrame note in _with_retry: on a shared/free-tier
+                          # IP, Yahoo silently blocking shows up as an empty response
+                          # far more often than an actual 429 status code, so that case
+                          # now triggers the same shared cooldown a real 429 does)
+REQUEST_TIMEOUT_S = 15.0  # hard ceiling on any single HTTP call to Yahoo -- see
+                          # _get_thread_session() below. Without this, a stalled/half-open
+                          # TCP connection blocks its worker thread FOREVER. With a
+                          # fixed-size ThreadPoolExecutor, enough of these pile up and
+                          # every worker ends up wedged on a dead socket at once -- the
+                          # scan just stops advancing mid-run, at a different, seemingly
+                          # arbitrary stock count each time. This is the actual root
+                          # cause of scans "getting stuck" partway through -- never
+                          # about which ticker, always about how many stalled sockets
+                          # happen to accumulate before every worker thread is occupied.
 
 def configure(max_retries: int | None = None, base_backoff: float | None = None,
               min_delay: float | None = None, cooldown: float | None = None) -> None:
@@ -122,15 +143,23 @@ def _throttle():
         _last_request_ts = time.monotonic()
 
 
-def _trigger_cooldown(seconds: float = COOLDOWN_S):
-    """Called by any thread that hits a real 429. Pushes _cooldown_until
-    forward so every other thread's next _throttle() call also pauses --
-    instead of 6 threads independently backing off and retrying into each
-    other, they all go quiet together and come back once, staggered by the
-    normal MIN_DELAY_S gate. This is what actually stops the retry storm
-    that used to cascade into an 80+ minute stall.
+def _trigger_cooldown(seconds: float | None = None):
+    """Called by any thread that hits a real 429 (or a silent empty-response
+    block, see _with_retry). Pushes _cooldown_until forward so every other
+    thread's next _throttle() call also pauses -- instead of 6 threads
+    independently backing off and retrying into each other, they all go
+    quiet together and come back once, staggered by the normal MIN_DELAY_S
+    gate. This is what actually stops the retry storm that used to cascade
+    into an 80+ minute stall.
+
+    NOTE: `seconds` used to default to COOLDOWN_S at function-definition time,
+    which froze in the value COOLDOWN_S had at import -- so configure()
+    changing COOLDOWN_S later had no effect on this default. Reading the
+    global at call time instead so configure() actually takes effect.
     """
     global _cooldown_until
+    if seconds is None:
+        seconds = COOLDOWN_S
     with _gate_lock:
         target = time.monotonic() + seconds
         if target > _cooldown_until:
@@ -139,14 +168,26 @@ def _trigger_cooldown(seconds: float = COOLDOWN_S):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# SESSION FACTORY
+# SESSION FACTORY  (one session per WORKER THREAD, not per symbol)
 # ────────────────────────────────────────────────────────────────────────────
-def _make_session():
-    """
-    Return a curl_cffi Chrome-impersonation session (or a plain requests
-    session as fallback).  A fresh session is created each time so that
-    Yahoo can't track connection state across symbols.
-    """
+# Originally a fresh session was created per _CachedTicker (i.e. per symbol),
+# on the theory that a new session per symbol stops Yahoo tracking connection
+# state across stocks. In practice a curl_cffi session is a live libcurl
+# handle with its own TLS/connection-pool buffers, and a scan covering
+# hundreds-to-thousands of symbols was creating that many of them and never
+# releasing the old ones (see _ticker_registry below) -- a real memory-growth
+# source on a constrained free-tier instance. One session per thread (there
+# are only as many of those as the "Parallel workers" slider allows) bounds
+# this to a small constant no matter how large the scan is, while still
+# rotating identity across the handful of worker threads.
+_thread_local = threading.local()
+
+
+def _get_thread_session():
+    sess = getattr(_thread_local, "session", None)
+    if sess is not None:
+        return sess
+
     if _HAS_CURL:
         sess = _curl_requests.Session(impersonate="chrome124")
     else:
@@ -169,25 +210,54 @@ def _make_session():
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
     })
+
+    # ── enforce a default timeout on every request through this session ────
+    # yfinance calls session.get(...)/session.request(...) internally without
+    # ever passing a timeout, so a stalled connection to Yahoo just hangs the
+    # calling thread indefinitely -- no exception, nothing for _with_retry's
+    # try/except to catch, nothing for the ThreadPoolExecutor to notice.
+    # Wrapping .request() here so ANY call path (yfinance internals included)
+    # gets a real ceiling, without having to touch yfinance's own code.
+    _orig_request = sess.request
+
+    def _request_with_timeout(method, url, *args, **kwargs):
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT_S)
+        return _orig_request(method, url, *args, **kwargs)
+
+    sess.request = _request_with_timeout
+    _thread_local.session = sess
     return sess
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # IN-PROCESS MEMORY CACHE  (survives across Streamlit reruns in same process)
 # ────────────────────────────────────────────────────────────────────────────
-_mem_cache: dict[str, tuple[float, Any]] = {}
+# Previously an unbounded dict -- holds the actual DataFrames per symbol per
+# property (history, financials, balance_sheet, ...), so a long full-universe
+# scan grew this without limit for the rest of the process's life (only a
+# restart clears it). A full-universe scan never revisits the same symbol
+# twice in one run, so this cache does nothing useful for that case anyway --
+# it only helps repeated lookups of the same symbol in a short window
+# (dashboard refreshes, resume flows, retry-failed). Sized for that, not for
+# holding the whole universe, with real LRU eviction so it can't grow past it.
+_MEM_CACHE_MAX = 150
+_mem_cache: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
 _cache_lock = threading.Lock()
 
 def _mem_get(key: str) -> Any | None:
     with _cache_lock:
         entry = _mem_cache.get(key)
         if entry and (time.time() - entry[0]) < CACHE_TTL_S:
+            _mem_cache.move_to_end(key)
             return entry[1]
     return None
 
 def _mem_set(key: str, value: Any):
     with _cache_lock:
         _mem_cache[key] = (time.time(), value)
+        _mem_cache.move_to_end(key)
+        while len(_mem_cache) > _MEM_CACHE_MAX:
+            _mem_cache.popitem(last=False)
 
 def clear_cache(symbol: str | None = None):
     """Clear in-process cache.  Pass symbol to clear only that ticker."""
@@ -221,10 +291,19 @@ def _with_retry(fn, *args, **kwargs):
             time.sleep(backoff)
         try:
             result = fn(*args, **kwargs)
-            # yf.download returns a DataFrame; empty == likely rate-limited
+            # yf.download returns a DataFrame; empty == likely rate-limited.
+            # On a shared/free-tier IP (Streamlit Cloud, HF Spaces, Render
+            # free tier), Yahoo silently throttling shows up as an empty
+            # response far more often than an actual 429 status -- so this
+            # now triggers the same shared cooldown a real 429 does, instead
+            # of only retrying locally on this one thread while every other
+            # worker thread kept hammering Yahoo through the same block at
+            # full speed. That mismatch is what used to turn a normal
+            # rate-limit into a scan-wide crawl.
             if isinstance(result, pd.DataFrame) and result.empty and attempt < MAX_RETRIES - 1:
                 logger.warning("yf_ratelimit: empty DataFrame on attempt %d — retrying", attempt + 1)
                 last_exc = RuntimeError("Empty DataFrame returned (possible silent 429)")
+                _trigger_cooldown()
                 continue
             return result
         except Exception as exc:
@@ -265,7 +344,7 @@ class _CachedTicker:
     def _get_yf(self) -> yf.Ticker:
         with self._yf_lock:
             if self._yf_obj is None:
-                sess = _make_session()
+                sess = _get_thread_session()
                 self._yf_obj = yf.Ticker(self._symbol, session=sess)
         return self._yf_obj
 
@@ -328,16 +407,42 @@ class _CachedTicker:
         return self._symbol
 
 
-# -- module-level Ticker cache (one object per symbol per process) -----------
-_ticker_registry: dict[str, _CachedTicker] = {}
+# -- module-level Ticker cache (bounded LRU, NOT one object per symbol ------
+#    forever) -----------------------------------------------------------
+# Previously unbounded: every symbol a scan ever touched stayed in this dict
+# for the rest of the process's life (only a restart clears it), and each
+# entry holds a _CachedTicker plus everything _mem_cache has cached for it.
+# A full-universe scan never revisits the same symbol twice in one run, so
+# none of that caching does anything useful for that case -- it's pure
+# accumulation, and on a memory-constrained free-tier instance it's a real
+# way to get OOM-killed partway through a large scan. Bounded with real LRU
+# eviction now -- sized for "helps repeated lookups of the same symbol in a
+# short window" (dashboard refreshes, resume flows), not "hold the whole
+# universe in memory at once."
+_TICKER_REGISTRY_MAX = 300
+_ticker_registry: "OrderedDict[str, _CachedTicker]" = OrderedDict()
 _registry_lock   = threading.Lock()
+
+# Printed once at import time (process boot) so a stale/uncached deploy is
+# visible directly in Streamlit Cloud's log viewer instead of having to infer
+# it from scan behaviour after the fact -- grep the log for "yf_ratelimit
+# CONFIG" right after a deploy finishes. If these numbers don't match this
+# file, the platform is still running an old build.
+logger.warning(
+    "yf_ratelimit CONFIG: MIN_DELAY_S=%.1f MAX_DELAY_S=%.1f COOLDOWN_S=%.1f "
+    "BASE_BACKOFF_S=%.1f REQUEST_TIMEOUT_S=%.1f TICKER_REGISTRY_MAX=%d MEM_CACHE_MAX=%d",
+    MIN_DELAY_S, MAX_DELAY_S, COOLDOWN_S, BASE_BACKOFF_S, REQUEST_TIMEOUT_S,
+    _TICKER_REGISTRY_MAX, _MEM_CACHE_MAX,
+)
 
 def safe_ticker(symbol: str) -> _CachedTicker:
     """
     Drop-in for yf.Ticker(symbol).
 
-    Returns a cached, rate-limit-aware wrapper.  The same object is
-    reused across all calls with the same symbol within a process.
+    Returns a cached, rate-limit-aware wrapper.  The same object is reused
+    across calls with the same symbol within a short window; least-recently-
+    used symbols are evicted once _TICKER_REGISTRY_MAX is exceeded so a long
+    scan can't grow this without bound.
 
     Usage:
         from yf_ratelimit import safe_ticker
@@ -346,9 +451,15 @@ def safe_ticker(symbol: str) -> _CachedTicker:
         df = t.history(period="1y")
     """
     with _registry_lock:
-        if symbol not in _ticker_registry:
-            _ticker_registry[symbol] = _CachedTicker(symbol)
-        return _ticker_registry[symbol]
+        existing = _ticker_registry.get(symbol)
+        if existing is not None:
+            _ticker_registry.move_to_end(symbol)
+            return existing
+        ticker = _CachedTicker(symbol)
+        _ticker_registry[symbol] = ticker
+        while len(_ticker_registry) > _TICKER_REGISTRY_MAX:
+            _ticker_registry.popitem(last=False)
+        return ticker
 
 
 def safe_download(
@@ -379,7 +490,7 @@ def safe_download(
         return cached
 
     def _do():
-        sess = _make_session()
+        sess = _get_thread_session()
         return yf.download(
             tickers,
             period=period,
