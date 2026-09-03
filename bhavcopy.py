@@ -189,19 +189,22 @@ def _fetch_nse_day(day: date) -> "pd.DataFrame | None":
 
 def _fetch_bse_day(day: date) -> "pd.DataFrame | None":
     """BSE's daily bhavcopy, current (2026) endpoint and format — plain CSV
-    in the SEBI-mandated UDiFF schema shared with NSE, confirmed directly
-    against the file list on
-    https://www.bseindia.com/markets/marketinfo/bhavcopy (the old
-    EQ{ddmmyy}_CSV.ZIP endpoint this originally pointed at is retired).
+    in the SEBI-mandated UDiFF schema shared with NSE, confirmed against a
+    real downloaded file (2026-09-02).
 
-    UDiFF's 'TckrSymb' column is each exchange's own native identifier —
-    for BSE that's historically the numeric scrip code (BSE has never used
-    NSE-style alpha symbols internally), matching the ".BO" root
-    tickers.py already builds. Not independently verified against a live
-    BSE file from this environment; if this assumption is wrong the
-    dataframe will just have zero rows matching any symbol, which
-    get_daily_series treats the same as an empty file — callers fall back
-    to yfinance, nothing breaks."""
+    Two things that looked plausible but were wrong before actually seeing
+    a file, now fixed:
+      • Join key is 'FinInstrmId' (numeric scrip code, e.g. 500325 for
+        RELIANCE) — NOT 'TckrSymb', which turned out to hold BSE's alpha
+        short name ("RELIANCE") rather than the code tickers.py's ".BO"
+        roots use.
+      • 'SctySrs' holds BSE's trading *group* (A/B/T/X/Z/...), not an
+        EQ/BE series code — filtering it the way the NSE fetch filters
+        SERIES silently dropped every row. This file (Sgmt=CM,
+        FinInstrmTp=STK only) is already restricted to cash-market equity
+        with no other instrument types mixed in, so no series filter is
+        needed here at all.
+    """
     yyyymmdd = day.strftime("%Y%m%d")
     referer = "https://www.bseindia.com/markets/marketinfo/bhavcopy"
     url = f"https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{yyyymmdd}_F_0000.CSV"
@@ -216,12 +219,8 @@ def _fetch_bse_day(day: date) -> "pd.DataFrame | None":
             return None
         df = pd.read_csv(io.BytesIO(resp.content))
         df.columns = [c.strip() for c in df.columns]
-        # UDiFF's equity-series filter (mirrors the NSE fetch's SERIES
-        # filter, just under this format's own column name).
-        if "SctySrs" in df.columns:
-            df = df[df["SctySrs"].astype(str).str.strip().isin(["EQ", "BE"])]
         rename = {
-            "TckrSymb": "symbol", "OpnPric": "open", "HghPric": "high",
+            "FinInstrmId": "symbol", "OpnPric": "open", "HghPric": "high",
             "LwPric": "low", "ClsPric": "close", "TtlTradgVol": "volume",
             "PrvsClsgPric": "prev_close",
         }
