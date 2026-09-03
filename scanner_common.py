@@ -44,6 +44,7 @@ import streamlit as st
 
 import yf_ratelimit
 from yf_ratelimit import safe_ticker as _rl_ticker, safe_download as _rl_download
+import bhavcopy
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -478,6 +479,32 @@ def render_rate_limit_controls(mode_key: str) -> dict:
             clear_dead_symbols()
             st.sidebar.success("Skip-list cleared")
             st.rerun()
+
+    with st.sidebar.expander("🧪 Bhavcopy Diagnostic"):
+        st.caption(
+            "Checks whether NSE/BSE's own daily data files are reachable "
+            "right now. Daily OHLCV uses this instead of Yahoo when it "
+            "works — no shell needed, this runs inside the deployed app."
+        )
+        if st.button("Run bhavcopy check", key=sskey(mode_key, "bhav_diag_btn"),
+                      use_container_width=True):
+            with st.spinner("Checking NSE and BSE bhavcopy..."):
+                for label, sym in [("NSE (RELIANCE)", "RELIANCE.NS"),
+                                    ("BSE (500325)", "500325.BO")]:
+                    result = bhavcopy.get_daily_series(sym, trading_days=10)
+                    if result is None:
+                        st.error(
+                            f"❌ {label}: no data — fetch failed, blocked, or "
+                            f"NSE/BSE changed their URL/format. Not a scan "
+                            f"failure: this exchange's daily calls just fall "
+                            f"back to yfinance automatically."
+                        )
+                    else:
+                        latest = result.iloc[-1]
+                        st.success(
+                            f"✅ {label}: {len(result)} days · latest close "
+                            f"{latest['close']:.2f} ({latest['date']})"
+                        )
 
     return {
         "max_workers": max_workers_ui,
