@@ -65,7 +65,6 @@ import io
 import logging
 import os
 import threading
-import zipfile
 from datetime import date, timedelta
 
 import pandas as pd
@@ -189,16 +188,23 @@ def _fetch_nse_day(day: date) -> "pd.DataFrame | None":
 
 
 def _fetch_bse_day(day: date) -> "pd.DataFrame | None":
-    """BSE's full bhavcopy for one trading day, keyed by numeric scrip code
-    (matches the ".BO" root tickers.py already uses). BSE has changed this
-    endpoint/format more often than NSE historically, and — like NSE — 403s
-    bare requests that don't look like a browser that actually visited the
-    site: a warm-up GET to the bhavcopy page (for cookies) plus a Referer
-    header pointing at it, same pattern NSE needs. Any failure here just
-    falls back to yfinance same as an NSE failure would."""
-    ddmmyy = day.strftime("%d%m%y")
-    referer = "https://www.bseindia.com/markets/marketinfo/BhavCopy.aspx"
-    url = f"https://www.bseindia.com/download/BhavCopy/Equity/EQ{ddmmyy}_CSV.ZIP"
+    """BSE's daily bhavcopy, current (2026) endpoint and format — plain CSV
+    in the SEBI-mandated UDiFF schema shared with NSE, confirmed directly
+    against the file list on
+    https://www.bseindia.com/markets/marketinfo/bhavcopy (the old
+    EQ{ddmmyy}_CSV.ZIP endpoint this originally pointed at is retired).
+
+    UDiFF's 'TckrSymb' column is each exchange's own native identifier —
+    for BSE that's historically the numeric scrip code (BSE has never used
+    NSE-style alpha symbols internally), matching the ".BO" root
+    tickers.py already builds. Not independently verified against a live
+    BSE file from this environment; if this assumption is wrong the
+    dataframe will just have zero rows matching any symbol, which
+    get_daily_series treats the same as an empty file — callers fall back
+    to yfinance, nothing breaks."""
+    yyyymmdd = day.strftime("%Y%m%d")
+    referer = "https://www.bseindia.com/markets/marketinfo/bhavcopy"
+    url = f"https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{yyyymmdd}_F_0000.CSV"
     try:
         sess = _get_session()
         try:
@@ -208,17 +214,16 @@ def _fetch_bse_day(day: date) -> "pd.DataFrame | None":
         resp = sess.get(url, timeout=_REQUEST_TIMEOUT_S, headers={"Referer": referer})
         if resp.status_code != 200 or not resp.content:
             return None
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            names = zf.namelist()
-            if not names:
-                return None
-            with zf.open(names[0]) as f:
-                df = pd.read_csv(f)
-        df.columns = [c.strip().upper() for c in df.columns]
+        df = pd.read_csv(io.BytesIO(resp.content))
+        df.columns = [c.strip() for c in df.columns]
+        # UDiFF's equity-series filter (mirrors the NSE fetch's SERIES
+        # filter, just under this format's own column name).
+        if "SctySrs" in df.columns:
+            df = df[df["SctySrs"].astype(str).str.strip().isin(["EQ", "BE"])]
         rename = {
-            "SC_CODE": "symbol", "OPEN": "open", "HIGH": "high",
-            "LOW": "low", "CLOSE": "close", "NO_OF_SHRS": "volume",
-            "PREVCLOSE": "prev_close",
+            "TckrSymb": "symbol", "OpnPric": "open", "HghPric": "high",
+            "LwPric": "low", "ClsPric": "close", "TtlTradgVol": "volume",
+            "PrvsClsgPric": "prev_close",
         }
         df = df.rename(columns=rename)
         needed = ["symbol", "open", "high", "low", "close", "volume"]
@@ -263,6 +268,15 @@ def _split_symbol(yf_symbol: str) -> "tuple[str, str] | tuple[None, None]":
     if yf_symbol.endswith(".BO"):
         return yf_symbol[:-3], "BSE"
     return None, None
+
+
+def debug_fetch_raw(exchange: str, day: "date | None" = None) -> "pd.DataFrame | None":
+    """Diagnostic helper, not used by the normal fetch path: the raw,
+    unmatched bhavcopy for one exchange/day (defaults to today), bypassing
+    per-symbol lookup. Lets a caller tell apart 'the fetch itself failed'
+    from 'the fetch worked but the symbol join-key assumption is wrong' --
+    see the Bhavcopy Diagnostic panel in scanner_common.py's sidebar."""
+    return _get_day(exchange, day or date.today())
 
 
 def get_daily_series(yf_symbol: str, trading_days: int = 65) -> "pd.DataFrame | None":

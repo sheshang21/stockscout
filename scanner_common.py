@@ -489,16 +489,26 @@ def render_rate_limit_controls(mode_key: str) -> dict:
         if st.button("Run bhavcopy check", key=sskey(mode_key, "bhav_diag_btn"),
                       use_container_width=True):
             with st.spinner("Checking NSE and BSE bhavcopy..."):
-                for label, sym in [("NSE (RELIANCE)", "RELIANCE.NS"),
-                                    ("BSE (500325)", "500325.BO")]:
+                for label, sym, exch in [("NSE (RELIANCE)", "RELIANCE.NS", "NSE"),
+                                          ("BSE (500325)", "500325.BO", "BSE")]:
                     result = bhavcopy.get_daily_series(sym, trading_days=10)
                     if result is None:
-                        st.error(
-                            f"❌ {label}: no data — fetch failed, blocked, or "
-                            f"NSE/BSE changed their URL/format. Not a scan "
-                            f"failure: this exchange's daily calls just fall "
-                            f"back to yfinance automatically."
-                        )
+                        raw = bhavcopy.debug_fetch_raw(exch)
+                        if raw is None:
+                            st.error(
+                                f"❌ {label}: fetch itself failed — blocked, "
+                                f"URL/format changed, or no file for today "
+                                f"yet. Falls back to yfinance automatically."
+                            )
+                        else:
+                            sample = ", ".join(raw["symbol"].astype(str).head(5))
+                            st.warning(
+                                f"⚠️ {label}: fetch worked ({len(raw)} rows) "
+                                f"but no row matched symbol `{sym.split('.')[0]}` "
+                                f"— the join-key assumption may be wrong for "
+                                f"this exchange. Sample symbols in the file: "
+                                f"{sample}. Falls back to yfinance automatically."
+                            )
                     else:
                         latest = result.iloc[-1]
                         st.success(
