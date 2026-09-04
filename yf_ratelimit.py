@@ -1,37 +1,6 @@
 """
-yf_ratelimit.py  ·  Universal yfinance Rate-Limit Shield  (in-process variant)
-=================================================================================
-*** This is the ROOT copy, used standalone by sheshscout.py (the Streamlit
-*** app) -- NOT the same file as core/yf_ratelimit.py, which core/scanner.py
-*** uses for the separate FastAPI+Celery service.
-***
-*** THE BUG THIS FILE FIXES (2026-09-03): this file had been overwritten
-*** with a byte-for-byte copy of core/yf_ratelimit.py -- the Redis-backed
-*** variant -- even though its own docstring said it should stay the
-*** in-process version. core/yf_ratelimit.py's _throttle() calls
-*** core/redis_client.py's throttle_wait(), which is written to FAIL OPEN
-*** (proceed with zero delay) whenever Redis is unreachable -- correct
-*** behaviour for that file's real use case (a flaky Redis shouldn't wedge
-*** a Celery worker), but catastrophic here: Streamlit Cloud runs this app
-*** with no Redis at all, so EVERY throttle_wait() call hit a connection
-*** error and returned instantly. With that gate silently doing nothing,
-*** sheshscout.py's 6 parallel workers x 3 Yahoo calls each fired in a
-*** burst of ~18 simultaneous requests at scan start -- hence 429s within
-*** the first couple of symbols, not gradually over a long scan. This file
-*** restores a real threading.Lock-based gate that has no Redis dependency
-*** and therefore can't silently fail open the same way -- it's a plain
-*** in-process value, either it throttles or the process crashed.
-***
-*** Two processes (2+ Streamlit instances, or this app plus something
-*** else) still won't coordinate with each other under this design -- an
-*** in-process lock only ever sees its own process, by definition. That's
-*** a real, known limitation, not an oversight: it's the same one
-*** core/yf_ratelimit.py's docstring describes for why THAT file needed
-*** Redis in the first place (multiple Celery worker processes). It does
-*** not apply here unless this Streamlit app is itself ever scaled to
-*** multiple instances -- if that happens, this file would need the same
-*** Redis-backed treatment core/yf_ratelimit.py already has, not before.
-
+yf_ratelimit.py  ·  Universal yfinance Rate-Limit Shield
+=========================================================
 Drop-in replacement / umbrella for ALL yfinance calls in this app.
 
 HOW IT WORKS
@@ -40,10 +9,7 @@ HOW IT WORKS
 2. Streamlit @st.cache_data               →  deduplicate identical calls (1-hr TTL)
 3. Exponential back-off with jitter       →  survive transient 429s
 4. In-process LRU memory cache            →  zero-network hits for repeat symbols
-5. In-process threading.Lock throttle     →  stay under Yahoo's rate budget,
-                                              shared across every worker THREAD
-                                              in this one process (see note above
-                                              on why that's the right scope here)
+5. Concurrency throttle (1 req/sec)       →  stay under Yahoo's rate budget
 
 HOW TO USE  (two-line migration per file)
 -----------------------------------------
@@ -59,10 +25,31 @@ AFTER:
 
 Everything else (.info, .financials, .history, .balance_sheet, .cashflow,
 .options, .option_chain …) works exactly the same on the returned object.
+
+HUGGING FACE SPACES NOTES
+--------------------------
+• curl_cffi is the #1 fix for HF Spaces / Streamlit Cloud rate limits.
+  Add to requirements.txt:  curl_cffi>=0.6.2
+• The module auto-falls-back to requests if curl_cffi is absent.
+• No secrets or env-vars required — works out of the box.
+
+IF YOU'RE STILL GETTING 429s WITH ALL OF THE ABOVE IN PLACE
+--------------------------------------------------------------
+Everything above (curl_cffi impersonation, backoff, shared cooldown,
+caching) only controls how politely THIS process talks to Yahoo. It
+can't fix Yahoo throttling the IP itself, which on Streamlit Cloud's
+free tier is shared across many unrelated apps' traffic, not just
+yours. If 429s persist with sensible MIN_DELAY_S/COOLDOWN_S values,
+the remaining lever is a proxy so Yahoo sees a different IP:
+    export YF_HTTP_PROXY="http://user:pass@host:port"
+or call `configure(proxy="http://user:pass@host:port")` once at
+startup. Unset by default — this is opt-in and requires your own
+proxy provider, nothing here calls out anywhere unless you set one.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import random
@@ -92,82 +79,59 @@ except ImportError:
 
 import yfinance as yf
 
+logger.warning("yf_ratelimit: curl_cffi available = %s (install curl_cffi if False -- "
+                "the single biggest fix for Streamlit Cloud / HF Spaces 429s)", _HAS_CURL)
+
 # ────────────────────────────────────────────────────────────────────────────
-# CONFIG  (env-var overridable -- set these on Streamlit Cloud's Secrets/env
-# without touching code or waiting on a deploy. Every value below falls back
-# to its current tuned default if the env var is unset or unparsable.)
+# CONFIG  (tune here if needed)
 # ────────────────────────────────────────────────────────────────────────────
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        logger.warning("yf_ratelimit: bad value for %s, using default %s", name, default)
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        logger.warning("yf_ratelimit: bad value for %s, using default %s", name, default)
-        return default
-
-
-MIN_DELAY_S      = _env_float("YF_MIN_DELAY_S", 1.5)     # minimum pause between Yahoo requests
-                          # (was 1.1 -- bumped as extra margin on 2026-09-03 alongside the
-                          # throttle fix itself, since the 1.1s figure was never actually
-                          # being enforced in production until now)
-MAX_DELAY_S      = _env_float("YF_MAX_DELAY_S", 4.0)     # maximum pause (random jitter)
-MAX_RETRIES      = _env_int("YF_MAX_RETRIES", 3)         # retry budget per call
-BASE_BACKOFF_S   = _env_float("YF_BASE_BACKOFF_S", 4.0)  # base for exponential backoff on 429
-CACHE_TTL_S      = _env_int("YF_CACHE_TTL_S", 3600)      # in-process cache TTL (seconds)
-COOLDOWN_S       = _env_float("YF_COOLDOWN_S", 35.0)     # shared pause applied to ALL threads
-                          # in this process after any 429, OR after several consecutive
-                          # silent empty responses (see EMPTY_STREAK_THRESHOLD below) --
-                          # NOT after every single empty response. A single legitimately-
-                          # delisted or no-trades-today symbol isn't evidence of a block;
-                          # a real silent block shows up as MANY empties in a row across
-                          # unrelated symbols.
-REQUEST_TIMEOUT_S = _env_float("YF_REQUEST_TIMEOUT_S", 15.0)  # hard ceiling on any single
-                          # HTTP call to Yahoo -- see _make_session() below. Without this, a
-                          # stalled/half-open TCP connection blocks its worker thread FOREVER.
-EMPTY_STREAK_THRESHOLD = _env_int("YF_EMPTY_STREAK_THRESHOLD", 4)  # consecutive empty
-                          # responses across ALL threads before treating it as a real
-                          # silent block rather than one quiet symbol.
-_CHROME_UA       = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# Optional outbound proxy -- see configure()'s proxy= param below. Unset by
-# default; can be set via configure(proxy=...) or the YF_HTTP_PROXY /
-# HTTPS_PROXY / HTTP_PROXY env vars at process start. This is the one lever
-# that helps once curl_cffi + backoff + throttle are already in place and
-# Yahoo is still blocking at the IP level (a shared free-tier egress IP).
-_PROXY_URL: str | None = (
-    os.environ.get("YF_HTTP_PROXY")
-    or os.environ.get("HTTPS_PROXY")
-    or os.environ.get("HTTP_PROXY")
-    or None
-)
-_session_version = 0  # bumped by configure(proxy=...) so existing per-thread
-                       # sessions rebuild themselves (with the new proxy) on
-                       # their next call.
-
+MIN_DELAY_S      = 1.1    # minimum pause between Yahoo requests (bumped from 0.8 --
+                          # Streamlit Cloud's free-tier egress IP is shared across many
+                          # other apps, so it gets throttled harder than a dedicated IP)
+MAX_DELAY_S      = 3.2    # maximum pause (random jitter)
+MAX_RETRIES      = 3      # retry budget per call
+BASE_BACKOFF_S   = 4.0    # base for exponential backoff on 429 (bumped from 3.0)
+CACHE_TTL_S      = 3600   # in-process cache TTL (1 hour)
+COOLDOWN_S       = 35.0   # shared pause applied to ALL threads after any 429 OR a
+                          # silent empty-response block (bumped from 20.0 -- see the
+                          # empty-DataFrame note in _with_retry: on a shared/free-tier
+                          # IP, Yahoo silently blocking shows up as an empty response
+                          # far more often than an actual 429 status code, so that case
+                          # now triggers the same shared cooldown a real 429 does)
+REQUEST_TIMEOUT_S = 15.0  # hard ceiling on any single HTTP call to Yahoo -- see
+                          # _get_thread_session() below. Without this, a stalled/half-open
+                          # TCP connection blocks its worker thread FOREVER. With a
+                          # fixed-size ThreadPoolExecutor, enough of these pile up and
+                          # every worker ends up wedged on a dead socket at once -- the
+                          # scan just stops advancing mid-run, at a different, seemingly
+                          # arbitrary stock count each time. This is the actual root
+                          # cause of scans "getting stuck" partway through -- never
+                          # about which ticker, always about how many stalled sockets
+                          # happen to accumulate before every worker thread is occupied.
 
 def configure(max_retries: int | None = None, base_backoff: float | None = None,
               min_delay: float | None = None, cooldown: float | None = None,
               proxy: str | None = None) -> None:
-    """Let callers (e.g. the Streamlit UI's Retry/Backoff sliders) change
-    retry behaviour at runtime. Safe to call at the start of every scan.
+    """Let callers (the Streamlit UI's Retry/Backoff sliders) actually change
+    retry behaviour at runtime. Previously the UI sliders for this existed
+    but were never wired to anything real -- every call silently used the
+    hardcoded MAX_RETRIES/BASE_BACKOFF_S above regardless of what the sidebar
+    said. This makes those controls do what they claim to do.
+    Safe to call at the start of every scan (cheap global reassignment).
 
     proxy: an http(s) proxy URL (e.g. "http://user:pass@host:port"), or ""
-    to clear one. New sessions pick up the change; existing per-thread
-    sessions are marked stale so the new proxy takes effect on their next
-    call rather than only for new threads.
+    to clear one. Every backoff/cooldown tuning in this file only changes
+    HOW POLITELY this process retries against Yahoo -- it can't help if
+    Yahoo has throttled the shared Streamlit Cloud egress IP itself, which
+    is the actual cause of most 429s once curl_cffi + backoff are already
+    in place (see the KEY LIMITATION note below _get_thread_session). A
+    proxy is the one lever that actually changes which IP Yahoo sees. No
+    proxy is configured by default -- this is opt-in and costs nothing to
+    leave unset. New sessions pick up the change; existing per-thread
+    sessions are cleared so the new proxy takes effect on their next call
+    rather than only for new threads.
     """
-    global MAX_RETRIES, BASE_BACKOFF_S, MIN_DELAY_S, COOLDOWN_S, _PROXY_URL, _session_version
+    global MAX_RETRIES, BASE_BACKOFF_S, MIN_DELAY_S, COOLDOWN_S, _PROXY_URL
     if max_retries is not None:
         MAX_RETRIES = max(1, int(max_retries))
     if base_backoff is not None:
@@ -178,89 +142,150 @@ def configure(max_retries: int | None = None, base_backoff: float | None = None,
         COOLDOWN_S = max(1.0, float(cooldown))
     if proxy is not None:
         _PROXY_URL = proxy.strip() or None
-        _session_version += 1
+        _reset_thread_sessions()
+# Optional outbound proxy -- see configure()'s proxy= param above for why
+# this is the one lever that actually helps once backoff/cooldown/curl_cffi
+# are already in place. Unset by default; can be set via configure(proxy=...)
+# or the YF_HTTP_PROXY / HTTPS_PROXY / HTTP_PROXY env vars at process start.
+_PROXY_URL: str | None = (
+    os.environ.get("YF_HTTP_PROXY")
+    or os.environ.get("HTTPS_PROXY")
+    or os.environ.get("HTTP_PROXY")
+    or None
+)
+_session_version = 0  # bumped by _reset_thread_sessions() so existing
+                       # per-thread sessions rebuild themselves (with the
+                       # new proxy) on their next call, instead of only
+                       # affecting threads created after configure() runs.
 
 
+def _reset_thread_sessions() -> None:
+    global _session_version
+    _session_version += 1
+
+
+_CHROME_UA       = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 # ────────────────────────────────────────────────────────────────────────────
-# RATE-LIMIT GATE  (in-process only -- shared across every worker THREAD in
-# this one process via a plain threading.Lock. See module docstring for why
-# that's the correct scope for this file, and why it must NOT depend on
-# Redis or anything else that can be unreachable and fail silently.)
+# RATE-LIMIT GATE  (shared across all threads)
 # ────────────────────────────────────────────────────────────────────────────
-_throttle_lock = threading.Lock()
-_last_request_time = 0.0
-_cooldown_until = 0.0
-_empty_streak = 0
+_gate_lock       = threading.Lock()
+_last_request_ts = 0.0
+_cooldown_until  = 0.0   # monotonic timestamp; all threads wait until this passes
+
+# ────────────────────────────────────────────────────────────────────────────
+# LIVE STATUS  (for the app UI, not just server logs)
+# ────────────────────────────────────────────────────────────────────────────
+# Everything below used to only reach a Python logger.warning() -- fine for
+# grepping Streamlit Cloud's server log viewer after the fact, but invisible
+# in the app itself while a scan is running. scanner_common's live-status
+# panel polls this during a scan so 429s/cooldowns/retries show up in the UI
+# in real time, not just in a log file the user has to go copy-paste out.
+from collections import deque
+
+_EVENT_LOG_MAX = 200
+_event_log: "deque[dict]" = deque(maxlen=_EVENT_LOG_MAX)
+_event_lock = threading.Lock()
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+
+def _log_event(message: str, level: str = "info") -> None:
+    with _event_lock:
+        _event_log.append({"ts": time.time(), "level": level, "message": message})
+
+
+def get_recent_events(n: int = 15) -> list[dict]:
+    """Most recent rate-limit-level events (429s, cooldowns, empty-response
+    retries), oldest first. For display in the app's live-status panel."""
+    with _event_lock:
+        return list(_event_log)[-n:]
+
+
+def clear_events() -> None:
+    with _event_lock:
+        _event_log.clear()
+
+
+def get_status() -> dict:
+    """Snapshot of the shared rate-limit gate, for a live status widget:
+    is a cooldown active right now (and for how much longer), and how many
+    Yahoo requests are actually in flight across all worker threads."""
+    now = time.monotonic()
+    with _gate_lock:
+        cooldown_remaining = max(0.0, _cooldown_until - now)
+    with _inflight_lock:
+        inflight = _inflight
+    return {
+        "cooldown_active": cooldown_remaining > 0,
+        "cooldown_remaining": cooldown_remaining,
+        "inflight": inflight,
+        "min_delay_s": MIN_DELAY_S,
+    }
 
 
 def _throttle():
-    """Block until it's safe to make the next Yahoo request. Pure
-    in-process state (module globals + a lock) -- nothing here can be
-    unreachable the way a network dependency could be, so there is no
-    fail-open path to worry about: this always actually waits."""
-    global _last_request_time
-    while True:
-        with _throttle_lock:
-            now = time.time()
-            if now < _cooldown_until:
-                wait = _cooldown_until - now
-            else:
-                wait = MIN_DELAY_S - (now - _last_request_time)
-            if wait <= 0:
-                _last_request_time = time.time()
-                return
-        time.sleep(min(wait, 5))  # re-check in slices, don't oversleep past a cleared cooldown
+    """Block until at least MIN_DELAY_S has elapsed since the last call,
+    AND until any active shared cooldown (see _trigger_cooldown) has expired.
+    """
+    global _last_request_ts
+    with _gate_lock:
+        now = time.monotonic()
+        if now < _cooldown_until:
+            time.sleep(_cooldown_until - now)
+            now = time.monotonic()
+        wait = MIN_DELAY_S - (now - _last_request_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_ts = time.monotonic()
 
 
-def _trigger_cooldown(seconds: float = COOLDOWN_S):
-    """Called by any thread that hits a real 429. Pushes the shared
-    cooldown deadline forward so every other thread's next _throttle()
-    call also pauses -- instead of N threads independently backing off
-    and retrying into each other, they all go quiet together."""
+def _trigger_cooldown(seconds: float | None = None):
+    """Called by any thread that hits a real 429 (or a silent empty-response
+    block, see _with_retry). Pushes _cooldown_until forward so every other
+    thread's next _throttle() call also pauses -- instead of 6 threads
+    independently backing off and retrying into each other, they all go
+    quiet together and come back once, staggered by the normal MIN_DELAY_S
+    gate. This is what actually stops the retry storm that used to cascade
+    into an 80+ minute stall.
+
+    NOTE: `seconds` used to default to COOLDOWN_S at function-definition time,
+    which froze in the value COOLDOWN_S had at import -- so configure()
+    changing COOLDOWN_S later had no effect on this default. Reading the
+    global at call time instead so configure() actually takes effect.
+    """
     global _cooldown_until
-    with _throttle_lock:
-        target = time.time() + seconds
-        if target > _cooldown_until:  # only move forward, never backward
+    if seconds is None:
+        seconds = COOLDOWN_S
+    with _gate_lock:
+        target = time.monotonic() + seconds
+        if target > _cooldown_until:
             _cooldown_until = target
     logger.warning("yf_ratelimit: 429 detected -- cooling down ALL threads for %.0fs", seconds)
-
-
-def _note_empty_response(cooldown_seconds: float = COOLDOWN_S) -> bool:
-    """Record one empty/possibly-blocked response. Returns True if this
-    pushed the streak over EMPTY_STREAK_THRESHOLD and triggered the shared
-    cooldown."""
-    global _empty_streak
-    with _throttle_lock:
-        _empty_streak += 1
-        streak = _empty_streak
-    if streak >= EMPTY_STREAK_THRESHOLD:
-        logger.warning(
-            "yf_ratelimit: %d empty responses in a row -- treating as a real "
-            "block, cooling down ALL threads for %.0fs", streak, cooldown_seconds,
-        )
-        _trigger_cooldown(cooldown_seconds)
-        with _throttle_lock:
-            _empty_streak = 0
-        return True
-    return False
-
-
-def _note_success() -> None:
-    """Any real (non-empty) response breaks the empty streak."""
-    global _empty_streak
-    with _throttle_lock:
-        _empty_streak = 0
+    _log_event(f"🧊 Cooling down all workers for {seconds:.0f}s", "cooldown")
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# SESSION FACTORY
+# SESSION FACTORY  (one session per WORKER THREAD, not per symbol)
 # ────────────────────────────────────────────────────────────────────────────
+# Originally a fresh session was created per _CachedTicker (i.e. per symbol),
+# on the theory that a new session per symbol stops Yahoo tracking connection
+# state across stocks. In practice a curl_cffi session is a live libcurl
+# handle with its own TLS/connection-pool buffers, and a scan covering
+# hundreds-to-thousands of symbols was creating that many of them and never
+# releasing the old ones (see _ticker_registry below) -- a real memory-growth
+# source on a constrained free-tier instance. One session per thread (there
+# are only as many of those as the "Parallel workers" slider allows) bounds
+# this to a small constant no matter how large the scan is, while still
+# rotating identity across the handful of worker threads.
 _thread_local = threading.local()
 
-def _make_session():
-    """Return a curl_cffi Chrome-impersonation session, cached per WORKER
-    THREAD (there are only max_workers of them -- see sheshscout.py's
-    sidebar slider -- so this is bounded no matter how large the scan is)."""
+
+def _get_thread_session():
     sess = getattr(_thread_local, "session", None)
     cached_version = getattr(_thread_local, "session_version", None)
     if sess is not None and cached_version == _session_version:
@@ -284,6 +309,8 @@ def _make_session():
         sess.mount("http://",  HTTPAdapter(max_retries=retry))
 
     if _PROXY_URL:
+        # curl_cffi and requests both accept the same {"http":..,"https":..}
+        # shape on .proxies.
         sess.proxies = {"http": _PROXY_URL, "https": _PROXY_URL}
 
     sess.headers.update({
@@ -297,6 +324,8 @@ def _make_session():
     # ever passing a timeout, so a stalled connection to Yahoo just hangs the
     # calling thread indefinitely -- no exception, nothing for _with_retry's
     # try/except to catch, nothing for the ThreadPoolExecutor to notice.
+    # Wrapping .request() here so ANY call path (yfinance internals included)
+    # gets a real ceiling, without having to touch yfinance's own code.
     _orig_request = sess.request
 
     def _request_with_timeout(method, url, *args, **kwargs):
@@ -312,10 +341,15 @@ def _make_session():
 # ────────────────────────────────────────────────────────────────────────────
 # IN-PROCESS MEMORY CACHE  (survives across Streamlit reruns in same process)
 # ────────────────────────────────────────────────────────────────────────────
-_MEM_CACHE_MAX = _env_int("YF_MEM_CACHE_MAX", 150)  # a full-universe scan never revisits
-                       # a symbol, so this cache does nothing useful for that case, only
-                       # eats memory before the scan gets meaningfully far. Sized for
-                       # dashboard refresh / resume re-lookups, not for holding the universe.
+# Previously an unbounded dict -- holds the actual DataFrames per symbol per
+# property (history, financials, balance_sheet, ...), so a long full-universe
+# scan grew this without limit for the rest of the process's life (only a
+# restart clears it). A full-universe scan never revisits the same symbol
+# twice in one run, so this cache does nothing useful for that case anyway --
+# it only helps repeated lookups of the same symbol in a short window
+# (dashboard refreshes, resume flows, retry-failed). Sized for that, not for
+# holding the whole universe, with real LRU eviction so it can't grow past it.
+_MEM_CACHE_MAX = 150
 _mem_cache: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
 _cache_lock = threading.Lock()
 
@@ -351,8 +385,11 @@ def clear_cache(symbol: str | None = None):
 # RETRY DECORATOR  (wraps any callable that talks to Yahoo)
 # ────────────────────────────────────────────────────────────────────────────
 def _with_retry(fn, *args, **kwargs):
-    """Call fn(*args, **kwargs) with throttle + exponential backoff on errors.
-    Returns the result or raises the last exception after MAX_RETRIES."""
+    """
+    Call fn(*args, **kwargs) with throttle + exponential backoff on errors.
+    Returns the result or raises the last exception after MAX_RETRIES.
+    """
+    global _inflight
     last_exc = None
     for attempt in range(MAX_RETRIES):
         _throttle()
@@ -361,24 +398,42 @@ def _with_retry(fn, *args, **kwargs):
             backoff = BASE_BACKOFF_S * (2 ** (attempt - 1)) + jitter
             logger.warning("yf_ratelimit: retry %d/%d — waiting %.1fs",
                            attempt, MAX_RETRIES, backoff)
+            _log_event(f"⏳ Retry {attempt}/{MAX_RETRIES} — waiting {backoff:.1f}s", "retry")
             time.sleep(backoff)
+        with _inflight_lock:
+            _inflight += 1
         try:
             result = fn(*args, **kwargs)
+            # yf.download returns a DataFrame; empty == likely rate-limited.
+            # On a shared/free-tier IP (Streamlit Cloud, HF Spaces, Render
+            # free tier), Yahoo silently throttling shows up as an empty
+            # response far more often than an actual 429 status -- so this
+            # now triggers the same shared cooldown a real 429 does, instead
+            # of only retrying locally on this one thread while every other
+            # worker thread kept hammering Yahoo through the same block at
+            # full speed. That mismatch is what used to turn a normal
+            # rate-limit into a scan-wide crawl.
             if isinstance(result, pd.DataFrame) and result.empty and attempt < MAX_RETRIES - 1:
                 logger.warning("yf_ratelimit: empty DataFrame on attempt %d — retrying", attempt + 1)
-                last_exc = RuntimeError("Empty DataFrame returned (possible silent block)")
-                _note_empty_response(COOLDOWN_S)
+                _log_event(f"⚠️ Empty response (attempt {attempt + 1}) — possible silent throttle", "warning")
+                last_exc = RuntimeError("Empty DataFrame returned (possible silent 429)")
+                _trigger_cooldown()
                 continue
-            _note_success()  # breaks any accumulating empty streak
             return result
         except Exception as exc:
             last_exc = exc
             msg = str(exc).lower()
             is_rate = any(x in msg for x in ("429", "rate", "too many", "forbidden", "403"))
             if not is_rate:
-                raise  # non-rate-limit error — don't keep retrying
+                # Non-rate-limit error — don't keep retrying
+                raise
             logger.warning("yf_ratelimit: rate-limit hit on attempt %d: %s", attempt + 1, exc)
-            _trigger_cooldown()  # a REAL 429 always pauses everyone immediately
+            _log_event(f"🚫 429 rate limit (attempt {attempt + 1}/{MAX_RETRIES})", "warning")
+            _trigger_cooldown()  # tell every other thread to back off too
+        finally:
+            with _inflight_lock:
+                _inflight -= 1
+
 
     raise last_exc or RuntimeError("yf_ratelimit: all retries exhausted")
 
@@ -388,8 +443,10 @@ def _with_retry(fn, *args, **kwargs):
 # ────────────────────────────────────────────────────────────────────────────
 
 class _CachedTicker:
-    """Lazy, cached wrapper around yf.Ticker.  All property accesses are
-    cached in-process and retried on rate-limit errors."""
+    """
+    Lazy, cached wrapper around yf.Ticker.  All property accesses are
+    cached in-process and retried on rate-limit errors.
+    """
     _PROPS = ("info", "financials", "income_stmt", "balance_sheet",
               "cashflow", "quarterly_financials", "quarterly_income_stmt",
               "quarterly_balance_sheet", "quarterly_cashflow",
@@ -402,13 +459,15 @@ class _CachedTicker:
         self._yf_obj  = None
         self._yf_lock = threading.Lock()
 
+    # -- lazy yf.Ticker construction -----------------------------------------
     def _get_yf(self) -> yf.Ticker:
         with self._yf_lock:
             if self._yf_obj is None:
-                sess = _make_session()
+                sess = _get_thread_session()
                 self._yf_obj = yf.Ticker(self._symbol, session=sess)
         return self._yf_obj
 
+    # -- generic cached property fetch ----------------------------------------
     def _fetch_prop(self, prop: str) -> Any:
         key = f"{self._symbol}:prop:{prop}"
         cached = _mem_get(key)
@@ -422,13 +481,16 @@ class _CachedTicker:
         _mem_set(key, result)
         return result
 
+    # -- expose all standard yf.Ticker properties transparently --------------
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
         if name in self._PROPS:
             return self._fetch_prop(name)
+        # Pass through anything else (e.g. .ticker, .isin)
         return getattr(self._get_yf(), name)
 
+    # -- history() — supports arbitrary kwargs --------------------------------
     def history(self, period="1mo", interval="1d", **kwargs) -> pd.DataFrame:
         key = f"{self._symbol}:history:{period}:{interval}:{sorted(kwargs.items())}"
         cached = _mem_get(key)
@@ -442,6 +504,7 @@ class _CachedTicker:
         _mem_set(key, result)
         return result
 
+    # -- option_chain() -------------------------------------------------------
     def option_chain(self, date: str | None = None) -> Any:
         key = f"{self._symbol}:option_chain:{date}"
         cached = _mem_get(key)
@@ -455,6 +518,7 @@ class _CachedTicker:
         _mem_set(key, result)
         return result
 
+    # -- repr / str -----------------------------------------------------------
     def __repr__(self):
         return f"<CachedTicker '{self._symbol}'>"
 
@@ -462,14 +526,27 @@ class _CachedTicker:
         return self._symbol
 
 
-# -- module-level Ticker cache (one object per symbol per process) -----------
-_TICKER_REGISTRY_MAX = _env_int("YF_TICKER_REGISTRY_MAX", 300)
+# -- module-level Ticker cache (bounded LRU, NOT one object per symbol ------
+#    forever) -----------------------------------------------------------
+# Previously unbounded: every symbol a scan ever touched stayed in this dict
+# for the rest of the process's life (only a restart clears it), and each
+# entry holds a _CachedTicker plus everything _mem_cache has cached for it.
+# A full-universe scan never revisits the same symbol twice in one run, so
+# none of that caching does anything useful for that case -- it's pure
+# accumulation, and on a memory-constrained free-tier instance it's a real
+# way to get OOM-killed partway through a large scan. Bounded with real LRU
+# eviction now -- sized for "helps repeated lookups of the same symbol in a
+# short window" (dashboard refreshes, resume flows), not "hold the whole
+# universe in memory at once."
+_TICKER_REGISTRY_MAX = 300
 _ticker_registry: "OrderedDict[str, _CachedTicker]" = OrderedDict()
 _registry_lock   = threading.Lock()
 
 # Printed once at import time (process boot) so a stale/uncached deploy is
-# visible directly in Streamlit Cloud's boot log -- grep for "yf_ratelimit
-# CONFIG" right after a deploy finishes.
+# visible directly in Streamlit Cloud's log viewer instead of having to infer
+# it from scan behaviour after the fact -- grep the log for "yf_ratelimit
+# CONFIG" right after a deploy finishes. If these numbers don't match this
+# file, the platform is still running an old build.
 logger.warning(
     "yf_ratelimit CONFIG: MIN_DELAY_S=%.1f MAX_DELAY_S=%.1f COOLDOWN_S=%.1f "
     "BASE_BACKOFF_S=%.1f REQUEST_TIMEOUT_S=%.1f TICKER_REGISTRY_MAX=%d MEM_CACHE_MAX=%d "
@@ -480,10 +557,18 @@ logger.warning(
 )
 
 def safe_ticker(symbol: str) -> _CachedTicker:
-    """Drop-in for yf.Ticker(symbol). Returns a cached, rate-limit-aware
-    wrapper. Usage:
+    """
+    Drop-in for yf.Ticker(symbol).
+
+    Returns a cached, rate-limit-aware wrapper.  The same object is reused
+    across calls with the same symbol within a short window; least-recently-
+    used symbols are evicted once _TICKER_REGISTRY_MAX is exceeded so a long
+    scan can't grow this without bound.
+
+    Usage:
         from yf_ratelimit import safe_ticker
         t = safe_ticker("RELIANCE.NS")
+        print(t.info["currentPrice"])
         df = t.history(period="1y")
     """
     with _registry_lock:
@@ -491,10 +576,11 @@ def safe_ticker(symbol: str) -> _CachedTicker:
         if existing is not None:
             _ticker_registry.move_to_end(symbol)
             return existing
-        _ticker_registry[symbol] = _CachedTicker(symbol)
+        ticker = _CachedTicker(symbol)
+        _ticker_registry[symbol] = ticker
         while len(_ticker_registry) > _TICKER_REGISTRY_MAX:
             _ticker_registry.popitem(last=False)
-        return _ticker_registry[symbol]
+        return ticker
 
 
 def safe_download(
@@ -504,10 +590,20 @@ def safe_download(
     flatten: bool = True,
     **kwargs,
 ) -> pd.DataFrame:
-    """Drop-in for yf.download(tickers, ...). Usage:
+    """
+    Drop-in for yf.download(tickers, ...).
+
+    Extra args vs yf.download:
+        flatten (bool): If True (default), flatten MultiIndex columns to
+                        single-level "Close", "Open" … instead of
+                        ("Close", "AAPL") etc.  Matches pre-0.2 behaviour.
+
+    Usage:
         from yf_ratelimit import safe_download
         df = safe_download("RELIANCE.NS", period="1y")
+        df = safe_download(["RELIANCE.NS", "TCS.NS"], start="2023-01-01")
     """
+    # Build a stable cache key
     ticker_key = tickers if isinstance(tickers, str) else "|".join(sorted(tickers))
     key = f"download:{ticker_key}:{period}:{interval}:{sorted(kwargs.items())}"
     cached = _mem_get(key)
@@ -515,7 +611,7 @@ def safe_download(
         return cached
 
     def _do():
-        sess = _make_session()
+        sess = _get_thread_session()
         return yf.download(
             tickers,
             period=period,
@@ -527,9 +623,11 @@ def safe_download(
 
     df = _with_retry(_do)
 
+    # Flatten MultiIndex columns (yfinance >= 0.2 wraps single-ticker downloads too)
     if flatten and isinstance(df.columns, pd.MultiIndex):
         if isinstance(tickers, str) or (isinstance(tickers, (list, tuple)) and len(tickers) == 1):
             df.columns = df.columns.get_level_values(0)
+        # For multi-ticker downloads keep MultiIndex — caller can handle it
 
     _mem_set(key, df)
     return df
@@ -537,6 +635,7 @@ def safe_download(
 
 # ────────────────────────────────────────────────────────────────────────────
 # STREAMLIT CACHE LAYER  (optional — adds cross-rerun deduplication)
+# Only activated when Streamlit is present (i.e. inside a Streamlit app)
 # ────────────────────────────────────────────────────────────────────────────
 if _HAS_ST:
     @st.cache_data(ttl=CACHE_TTL_S, show_spinner=False)
@@ -556,9 +655,7 @@ if _HAS_ST:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# QUICK SELF-TEST  (run with: python yf_ratelimit.py -- N/A on Streamlit
-# Cloud, which has no shell; use sheshscout.py's own diagnostic UI instead
-# if one exists, same pattern as the bhavcopy diagnostic panel)
+# QUICK SELF-TEST  (run with: python yf_ratelimit.py)
 # ────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
