@@ -85,10 +85,18 @@ logger.warning("yf_ratelimit: curl_cffi available = %s (install curl_cffi if Fal
 # ────────────────────────────────────────────────────────────────────────────
 # CONFIG  (tune here if needed)
 # ────────────────────────────────────────────────────────────────────────────
-MIN_DELAY_S      = 1.1    # minimum pause between Yahoo requests (bumped from 0.8 --
-                          # Streamlit Cloud's free-tier egress IP is shared across many
-                          # other apps, so it gets throttled harder than a dedicated IP)
-MAX_DELAY_S      = 3.2    # maximum pause (random jitter)
+MIN_DELAY_S      = 1.5    # minimum pause between Yahoo requests (bumped from 1.1 on
+                           # 2026-09-04 for extra safety margin -- NOTE: if you ever see
+                           # this file's own MIN_DELAY_S/MAX_DELAY_S values NOT match what
+                           # prints in the "yf_ratelimit CONFIG:" boot log line, that's not
+                           # a code bug -- it means a DIFFERENT yf_ratelimit.py (e.g. the
+                           # standalone one built for a different, single-file repo) got
+                           # pushed here by mistake. This repo's copy is the only one with
+                           # get_status()/get_recent_events()/_inflight tracking below --
+                           # scanner_common.py's live-status panel depends on those, so a
+                           # mismatched file here always surfaces as an AttributeError on
+                           # yf_ratelimit.get_status(), not a silent slowdown.
+MAX_DELAY_S      = 4.0    # maximum pause (random jitter) (bumped from 3.2 alongside MIN_DELAY_S)
 MAX_RETRIES      = 3      # retry budget per call
 BASE_BACKOFF_S   = 4.0    # base for exponential backoff on 429 (bumped from 3.0)
 CACHE_TTL_S      = 3600   # in-process cache TTL (1 hour)
