@@ -1,16 +1,13 @@
 """
-indicators.py — Shared technical-indicator math for all 3 scanner modes.
+indicators.py — Shared technical-indicator math for the positional scanner.
 
-Previously the positional scanner had its own numpy-array RSI/EMA/MACD/BB
-implementation, while the two intraday screeners had a *second*, subtly
-different pandas-Series RSI (no Wilder smoothing, plain rolling mean) and
-their own ATR. Two implementations of "RSI" that can disagree on the same
-data is exactly the kind of loose end that erodes trust in the scores, so
-every mode now calls the same functions.
+Every numeric period/threshold here takes a keyword argument with a
+default matching the scanner's original behaviour — mode_positional.py's
+sidebar passes its user-adjustable values through explicitly so nothing
+in here is hardcoded from the caller's point of view.
 
-All functions are defensive (never raise) and take/return plain
-numpy arrays or floats so they work equally well on daily-bar or 1-minute
-intraday closes.
+All functions are defensive (never raise) and take/return plain numpy
+arrays or floats.
 """
 
 from __future__ import annotations
@@ -50,16 +47,16 @@ def ema(prices: np.ndarray, period: int) -> float:
         return 0.0
 
 
-def macd(prices: np.ndarray) -> float:
+def macd(prices: np.ndarray, fast: int = 12, slow: int = 26) -> float:
     try:
-        if len(prices) < 26:
+        if len(prices) < slow:
             return 0.0
-        return ema(prices, 12) - ema(prices, 26)
+        return ema(prices, fast) - ema(prices, slow)
     except Exception:
         return 0.0
 
 
-def bollinger_position(prices: np.ndarray, period: int = 20) -> float:
+def bollinger_position(prices: np.ndarray, period: int = 20, std_mult: float = 2.0) -> float:
     """0 = at lower band, 100 = at upper band, 50 = mid."""
     try:
         prices = np.asarray(prices, dtype=float)
@@ -68,8 +65,8 @@ def bollinger_position(prices: np.ndarray, period: int = 20) -> float:
         recent = prices[-period:]
         sma = np.mean(recent)
         std = np.std(recent)
-        upper = sma + (2 * std)
-        lower = sma - (2 * std)
+        upper = sma + (std_mult * std)
+        lower = sma - (std_mult * std)
         if upper == lower:
             return 50.0
         position = ((prices[-1] - lower) / (upper - lower)) * 100
@@ -92,8 +89,7 @@ def volume_multiple(volumes: np.ndarray, window: int = 20) -> float:
 
 
 def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
-    """Average True Range, numpy version (matches the pandas rolling-mean
-    ATR the intraday screeners used, just without the pandas dependency)."""
+    """Average True Range."""
     try:
         highs = np.asarray(highs, dtype=float)
         lows = np.asarray(lows, dtype=float)
@@ -162,7 +158,21 @@ def detect_institutional_activity(volumes: np.ndarray, closes: np.ndarray) -> in
         return 0
 
 
-def detect_operator_activity(closes: np.ndarray, volumes: np.ndarray):
+def detect_operator_activity(
+    closes: np.ndarray,
+    volumes: np.ndarray,
+    *,
+    vol_spike_extreme_mult: float = 5.0,
+    vol_spike_high_mult: float = 3.0,
+    swing_extreme_pct: float = 8.0,
+    swing_avg_extreme_pct: float = 3.0,
+    swing_high_pct: float = 5.0,
+    swing_avg_high_pct: float = 2.0,
+    circuit_change_pct: float = 9.0,
+    circuit_hits_extreme: int = 3,
+    circuit_hits_high: int = 2,
+    operated_risk_cutoff: int = 40,
+):
     """Detect signs of pump/manipulation activity. Returns (is_operated, flags, risk_score)."""
     try:
         closes = np.asarray(closes, dtype=float)
@@ -177,11 +187,11 @@ def detect_operator_activity(closes: np.ndarray, volumes: np.ndarray):
         if avg_vol == 0:
             return False, [], 0
         max_recent_vol = np.max(volumes[-10:])
-        if max_recent_vol > avg_vol * 5:
-            flags.append("🚨 EXTREME volume spike (>5x avg) - Possible pump")
+        if max_recent_vol > avg_vol * vol_spike_extreme_mult:
+            flags.append(f"🚨 EXTREME volume spike (>{vol_spike_extreme_mult:g}x avg) - Possible pump")
             risk += 30
-        elif max_recent_vol > avg_vol * 3:
-            flags.append("⚠️ High volume spike (>3x avg) - Monitor closely")
+        elif max_recent_vol > avg_vol * vol_spike_high_mult:
+            flags.append(f"⚠️ High volume spike (>{vol_spike_high_mult:g}x avg) - Monitor closely")
             risk += 15
 
         recent_prices = closes[-10:]
@@ -191,26 +201,26 @@ def detect_operator_activity(closes: np.ndarray, volumes: np.ndarray):
                 swings.append(abs((recent_prices[i] - recent_prices[i - 1]) / recent_prices[i - 1]) * 100)
         avg_swing = np.mean(swings) if swings else 0
         max_swing = np.max(swings) if swings else 0
-        if max_swing > 8 and avg_swing > 3:
-            flags.append("🚨 Extreme volatility (>8% swings) - Operator activity likely")
+        if max_swing > swing_extreme_pct and avg_swing > swing_avg_extreme_pct:
+            flags.append(f"🚨 Extreme volatility (>{swing_extreme_pct:g}% swings) - Operator activity likely")
             risk += 25
-        elif max_swing > 5 and avg_swing > 2:
-            flags.append("⚠️ High volatility - Possible manipulation")
+        elif max_swing > swing_high_pct and avg_swing > swing_avg_high_pct:
+            flags.append(f"⚠️ High volatility (>{swing_high_pct:g}% swings) - Possible manipulation")
             risk += 12
 
         circuit_hits = 0
         for i in range(-20, 0):
             if i >= -len(closes) and i > -len(closes) and closes[i - 1] != 0:
                 daily_change = abs((closes[i] - closes[i - 1]) / closes[i - 1]) * 100
-                if daily_change > 9:
+                if daily_change > circuit_change_pct:
                     circuit_hits += 1
-        if circuit_hits >= 3:
+        if circuit_hits >= circuit_hits_extreme:
             flags.append("🚨 Multiple circuit hits - Highly manipulated")
             risk += 30
-        elif circuit_hits >= 2:
+        elif circuit_hits >= circuit_hits_high:
             flags.append("⚠️ Circuit hits detected - High risk")
             risk += 15
 
-        return risk >= 40, flags, risk
+        return risk >= operated_risk_cutoff, flags, risk
     except Exception:
         return False, [], 0

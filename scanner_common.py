@@ -1,31 +1,21 @@
 """
-scanner_common.py — Shared infrastructure for all 3 SheshScout modes
+scanner_common.py — Shared infrastructure for the Positional Scanner
 =======================================================================
-Positional (Ultra-Strict long-term), Intraday Short, Intraday Long all
-import from here so the three modes look, behave, and get maintained
-identically outside of their own core stock-scoring logic.
-
 Provides:
-  • Mode-namespaced session_state / widget keys (fixes state bleeding
-    between modes when the user switches the mode dropdown — this was
-    the source of the "Streamlit auto-reset" symptom: two modes quietly
-    sharing session_state keys like "scan_results").
-  • A single global Yahoo concurrency gate + bulletproof_fetch, shared
-    across modes because it's really about total simultaneous
-    connections to Yahoo from this process, not about any one mode.
-  • Disk-backed dead-symbol skip list, shared across modes (a delisted
-    symbol is delisted no matter which scanner asks).
-  • Disk-backed scan checkpoint/resume, one file per mode, so a killed
-    process (Streamlit Cloud health-check restarts, OOM, etc.) never
-    loses more than the in-flight batch — for all 3 modes, not just one.
-  • Reusable sidebar widgets: exchange picker, scan-mode picker
-    (Quick / Full / Slot-wise / Range / Custom — identical across all
-    3 modes), rate-limiting controls, checkpoint/resume controls.
-  • A generic concurrent scan runner: every mode supplies only its own
+  • Namespaced session_state / widget keys (sskey) so widget keys never
+    collide across reruns.
+  • A single global Yahoo concurrency gate + bulletproof_fetch.
+  • Disk-backed dead-symbol skip list.
+  • Disk-backed scan checkpoint/resume, so a killed process (host
+    restarts, OOM, etc.) never loses more than the in-flight batch.
+  • Sidebar widgets: exchange picker, scan-mode picker (Quick / Full /
+    Slot-wise / Range / Custom), rate-limiting controls, checkpoint/resume
+    controls.
+  • A generic concurrent scan runner: the caller supplies only its own
     "fetch + analyze one symbol" callable; progress bar, stats, batch
-    pausing, checkpointing, retry-failed and the non-blocking auto
-    refresh loop are implemented exactly once here.
-  • CSV export helper that always includes the company Name column.
+    pausing, checkpointing, retry-failed, and the live rate-limit status
+    panel are implemented once here.
+  • CSV export helper.
 """
 
 from __future__ import annotations
@@ -44,26 +34,17 @@ import streamlit as st
 
 import yf_ratelimit
 from yf_ratelimit import safe_ticker as _rl_ticker, safe_download as _rl_download
-import bhavcopy
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODE_POSITIONAL = "positional"
-MODE_SHORT = "intraday_short"
-MODE_LONG = "intraday_long"
-
-MODE_LABELS = {
-    MODE_POSITIONAL: "📊 Positional Scanner — Long-Term Value Investing",
-    MODE_SHORT: "📉 Intraday Short Screener",
-    MODE_LONG: "📈 Intraday Long (Buy) Screener",
-}
 
 
-# ── yfinance shim (rate-limit-safe, shared object for every mode) ───────────
+# ── yfinance shim (rate-limit-safe) ──────────────────────────────────────
 class _YFShim:
-    """Thin shim so `yf.Ticker(...)` / `yf.download(...)` calls in mode
-    modules transparently go through yf_ratelimit's Chrome-impersonation +
-    shared-cooldown + retry machinery."""
+    """So `yf.Ticker(...)` / `yf.download(...)` calls in mode_positional.py
+    transparently go through yf_ratelimit's session + cooldown + retry
+    machinery."""
 
     @staticmethod
     def Ticker(symbol, **_):
@@ -77,10 +58,8 @@ class _YFShim:
 yf = _YFShim()
 
 
-# ── Mode-namespaced keys ─────────────────────────────────────────────────
+# ── Namespaced keys ───────────────────────────────────────────────────────
 def sskey(mode_key: str, name: str) -> str:
-    """Namespace a session_state / widget key by mode so switching the mode
-    dropdown never lets one mode read or clobber another mode's state."""
     return f"{mode_key}__{name}"
 
 
@@ -96,7 +75,7 @@ def pop_state(mode_key: str, name: str, default=None):
     return st.session_state.pop(sskey(mode_key, name), default)
 
 
-# ── Global concurrency gate (shared across all modes/threads) ───────────────
+# ── Global concurrency gate ──────────────────────────────────────────────
 _YF_SEMAPHORE_COUNT = 6
 _YF_SEMAPHORE = threading.Semaphore(_YF_SEMAPHORE_COUNT)
 _SEM_LOCK = threading.Lock()
@@ -111,14 +90,10 @@ def _set_semaphore(count: int) -> None:
 
 
 def bulletproof_fetch(func, *args, **kwargs):
-    """Single-shot, semaphore-gated call. yf_ratelimit's _CachedTicker already
-    retries every individual Yahoo call internally with its own exponential
-    backoff before raising — retrying the *whole* fetch again here on top of
-    that multiplies delays (outer x inner) while holding a worker slot the
-    entire time, which is what used to stall scans for 80+ minutes under real
-    rate-limiting. So: call once, catch, bail. The semaphore is only held for
-    the single attempt, never across a sleep/backoff, so one slow symbol
-    can't starve the other workers.
+    """Single-shot, semaphore-gated call. yf_ratelimit already retries every
+    individual Yahoo call internally with its own backoff before raising —
+    retrying the *whole* fetch again here on top of that multiplies delays
+    while holding a worker slot the entire time. So: call once, catch, bail.
     """
     with _YF_SEMAPHORE:
         try:
@@ -127,14 +102,11 @@ def bulletproof_fetch(func, *args, **kwargs):
             return None
 
 
-# ── Known-dead symbol cache (shared across modes, disk-backed) ──────────────
-# A delisted symbol still triggers yf_ratelimit's full internal retry ladder
-# on every fresh scan/restart unless we short-circuit it before any network
-# call. Two independent empty results, at least an hour apart, are required
-# before a symbol is treated as dead — a one-off rate-limit burst (many
-# symbols empty at once, all within seconds of each other) never triggers a
-# blacklist entry; only a symbol that's *still* empty on a later, separate
-# scan will. Entries expire after 30 days in case a halted stock relists.
+# ── Known-dead symbol cache (disk-backed) ────────────────────────────────
+# Two independent empty results, at least an hour apart, are required
+# before a symbol is treated as dead — a one-off rate-limit burst never
+# triggers a blacklist entry; only a symbol that's *still* empty on a
+# later, separate scan will. Entries expire after 30 days.
 DEAD_SYMBOLS_PATH = os.path.join(_BASE_DIR, ".dead_symbols.json")
 _DEAD_SYMBOLS_TTL = 30 * 24 * 3600
 _DEAD_STRIKE_MIN_GAP = 3600
@@ -148,12 +120,9 @@ def _load_dead_symbols() -> dict:
         with open(DEAD_SYMBOLS_PATH, "r") as f:
             data = json.load(f)
         now = time.time()
-        cleaned = {}
-        for s, strikes in data.items():
-            strikes = [t for t in strikes if now - t < _DEAD_SYMBOLS_TTL]
-            if strikes:
-                cleaned[s] = strikes
-        return cleaned
+        return {s: strikes for s, strikes in
+                ((s, [t for t in ts if now - t < _DEAD_SYMBOLS_TTL]) for s, ts in data.items())
+                if strikes}
     except Exception:
         return {}
 
@@ -197,7 +166,7 @@ def count_dead_symbols() -> int:
     return len(_load_dead_symbols())
 
 
-# ── Generic thread-safe TTL data cache (mode + symbol + extra) ─────────────
+# ── Generic thread-safe TTL data cache ───────────────────────────────────
 _DATA_CACHE: dict = {}
 _DATA_CACHE_LOCK = threading.Lock()
 
@@ -216,7 +185,7 @@ def cache_set(key: str, data) -> None:
         _DATA_CACHE[key] = {"ts": time.time(), "data": data}
 
 
-# ── Disk-based scan checkpoint (one file per mode, survives restarts) ──────
+# ── Disk-based scan checkpoint (survives restarts) ───────────────────────
 def _checkpoint_path(mode_key: str) -> str:
     return os.path.join(_BASE_DIR, f".scan_checkpoint_{mode_key}.json")
 
@@ -266,7 +235,7 @@ def render_exchange_selector(mode_key: str):
                                     help="Loads tickers + names from nse_tickers.csv, adds .NS suffix",
                                     key=sskey(mode_key, "scan_nse"))
     scan_bse = st.sidebar.checkbox("✅ Scan BSE Stocks", value=True,
-                                    help="Loads BSE codes + names from bse_codes.csv, adds .BO suffix",
+                                    help="Loads tickers + names from bse_bhavcopy.csv, adds .BO suffix",
                                     key=sskey(mode_key, "scan_bse"))
 
     if not scan_nse and not scan_bse:
@@ -285,16 +254,14 @@ def render_exchange_selector(mode_key: str):
             parts.append(f"BSE: {bse_count}")
         st.sidebar.success(f"✅ Loaded {len(universe)} stocks\n" + " | ".join(parts))
     else:
-        st.sidebar.error("❌ No stocks loaded — check nse_tickers.csv / bse_codes.csv are present")
+        st.sidebar.error("❌ No stocks loaded — check nse_tickers.csv / bse_bhavcopy.csv are present")
 
     return scan_nse, scan_bse, universe
 
 
 # ── Sidebar: scan-mode picker (Quick / Full / Slot-wise / Range / Custom) ──
 def render_scan_mode_selector(mode_key: str, universe: list) -> list:
-    """Returns stocks_to_scan: list[TickerRecord]. Identical mechanics across
-    every mode — this is the "replicate everything except the core logic"
-    piece the positional scanner already had."""
+    """Returns stocks_to_scan: list[TickerRecord]."""
     import tickers as _tickers
 
     st.sidebar.markdown("---")
@@ -408,34 +375,36 @@ def render_scan_mode_selector(mode_key: str, universe: list) -> list:
     # Custom List
     custom_input = st.sidebar.text_area(
         "Enter symbols (one per line)",
-        "Stock names with exchange suffix:\nRELIANCE.NS\n500002.BO\nINFY.NS\n\n"
-        "Or without (defaults to NSE, bare numbers default to BSE):\nRELIANCE\nTCS",
+        "Stock names with exchange suffix:\nRELIANCE.NS\nABB.BO\nINFY.NS\n\n"
+        "Or without (defaults to NSE, bare numbers default to BSE code lookup):\nRELIANCE\nTCS",
         height=150, key=sskey(mode_key, "custom_list"),
     )
     universe_by_yf = {r["yf_symbol"]: r for r in universe}
     raw_symbols = [s.strip() for s in custom_input.split("\n") if s.strip()]
-    # Skip the placeholder helper lines if the user never replaced them
     raw_symbols = [s for s in raw_symbols if not s.lower().startswith(("stock names", "or without"))]
     return [_tickers.record_for_custom_symbol(s, universe_by_yf) for s in raw_symbols]
 
 
 # ── Sidebar: rate-limiting controls (workers / batching / retry) ───────────
 def render_rate_limit_controls(mode_key: str) -> dict:
+    """Every value here is read straight from its widget and returned in
+    rate_cfg — nothing about worker count, batching, or retry/backoff is
+    hardcoded; run_scan() and yf_ratelimit.configure() apply exactly what's
+    set here."""
     st.sidebar.markdown("---")
     st.sidebar.subheader("⚡ Rate Limiting Controls")
     st.sidebar.info(
-        "**⚡ Concurrent scan, shared Yahoo connection budget across all 3 modes.**\n"
-        "Recommended: **4–6 workers**. Each worker uses the same global semaphore so "
-        "Yahoo never sees more than (workers × calls-per-stock) simultaneous connections.\n"
-        "Reduce to 2–3 only if you still see 429s."
+        "Concurrent scan, single shared Yahoo connection budget. Recommended "
+        "4–6 workers — Yahoo never sees more than (workers × calls/stock) "
+        "simultaneous connections. Reduce to 2–3 if you still see 429s."
     )
 
-    max_workers_ui = st.sidebar.slider(
+    max_workers = st.sidebar.slider(
         "Parallel workers", min_value=1, max_value=16, value=6, step=1,
         help="How many stocks to fetch simultaneously. Lower if hitting 429s.",
         key=sskey(mode_key, "max_workers"),
     )
-    _set_semaphore(max_workers_ui)
+    _set_semaphore(max_workers)
 
     batch_size = st.sidebar.number_input(
         "Batch size (0 = no batching)", min_value=0, max_value=1000, value=0, step=10,
@@ -448,16 +417,26 @@ def render_rate_limit_controls(mode_key: str) -> dict:
         key=sskey(mode_key, "batch_pause"),
     )
 
-    with st.sidebar.expander("🔧 Retry / Backoff Settings"):
+    with st.sidebar.expander("🔧 Retry / Backoff / Delay Settings"):
         retry_max = st.number_input(
             "Max retries per stock", min_value=1, max_value=10, value=3, step=1,
             help="How many times yf_ratelimit retries a failed fetch before giving up.",
             key=sskey(mode_key, "retry_max"),
         )
-        retry_initial_delay = st.number_input(
+        retry_delay = st.number_input(
             "Retry base backoff (sec)", min_value=0.5, max_value=30.0, value=3.0, step=0.5,
             help="Base delay for exponential backoff on retries. Doubles each retry.",
             key=sskey(mode_key, "retry_delay"),
+        )
+        min_delay = st.number_input(
+            "Min delay between requests (sec)", min_value=0.1, max_value=10.0, value=1.5, step=0.1,
+            help="Floor on the gap between any two outgoing Yahoo requests, shared across all workers.",
+            key=sskey(mode_key, "min_delay"),
+        )
+        cooldown = st.number_input(
+            "Cooldown after a 429 (sec)", min_value=1.0, max_value=180.0, value=35.0, step=5.0,
+            help="Shared pause applied to every worker after any 429 or silent empty-response block.",
+            key=sskey(mode_key, "cooldown"),
         )
         stats_interval = st.number_input(
             "Stats update every N stocks", min_value=1, max_value=100, value=10, step=1,
@@ -465,63 +444,25 @@ def render_rate_limit_controls(mode_key: str) -> dict:
             key=sskey(mode_key, "stats_interval"),
         )
 
-    # These sliders now actually take effect (previously dead controls that
-    # were accepted by bulletproof_fetch's signature but never used).
-    yf_ratelimit.configure(max_retries=retry_max, base_backoff=retry_initial_delay)
+    yf_ratelimit.configure(max_retries=retry_max, base_backoff=retry_delay,
+                            min_delay=min_delay, cooldown=cooldown)
 
     dead_count = count_dead_symbols()
     if dead_count > 0:
         if st.sidebar.button(f"🧹 Clear skip-list ({dead_count} symbols)", use_container_width=True,
-                              help="Symbols currently being skipped as 'dead' (shared across all 3 modes). "
-                                   "Clear this if results look too low — a rate-limit burst can wrongly "
-                                   "flag valid symbols.",
+                              help="Symbols currently being skipped as 'dead'. Clear this if results "
+                                   "look too low — a rate-limit burst can wrongly flag valid symbols.",
                               key=sskey(mode_key, "clear_dead")):
             clear_dead_symbols()
             st.sidebar.success("Skip-list cleared")
             st.rerun()
 
-    with st.sidebar.expander("🧪 Bhavcopy Diagnostic"):
-        st.caption(
-            "Checks whether NSE/BSE's own daily data files are reachable "
-            "right now. Daily OHLCV uses this instead of Yahoo when it "
-            "works — no shell needed, this runs inside the deployed app."
-        )
-        if st.button("Run bhavcopy check", key=sskey(mode_key, "bhav_diag_btn"),
-                      use_container_width=True):
-            with st.spinner("Checking NSE and BSE bhavcopy..."):
-                for label, sym, exch in [("NSE (RELIANCE)", "RELIANCE.NS", "NSE"),
-                                          ("BSE (500325)", "500325.BO", "BSE")]:
-                    result = bhavcopy.get_daily_series(sym, trading_days=10)
-                    if result is None:
-                        raw = bhavcopy.debug_fetch_raw(exch)
-                        if raw is None:
-                            st.error(
-                                f"❌ {label}: fetch itself failed — blocked, "
-                                f"URL/format changed, or no file for today "
-                                f"yet. Falls back to yfinance automatically."
-                            )
-                        else:
-                            sample = ", ".join(raw["symbol"].astype(str).head(5))
-                            st.warning(
-                                f"⚠️ {label}: fetch worked ({len(raw)} rows) "
-                                f"but no row matched symbol `{sym.split('.')[0]}` "
-                                f"— the join-key assumption may be wrong for "
-                                f"this exchange. Sample symbols in the file: "
-                                f"{sample}. Falls back to yfinance automatically."
-                            )
-                    else:
-                        latest = result.iloc[-1]
-                        st.success(
-                            f"✅ {label}: {len(result)} days · latest close "
-                            f"{latest['close']:.2f} ({latest['date']})"
-                        )
-
     return {
-        "max_workers": max_workers_ui,
+        "max_workers": max_workers,
         "batch_size": batch_size,
         "batch_pause": batch_pause,
         "retry_max": retry_max,
-        "retry_delay": retry_initial_delay,
+        "retry_delay": retry_delay,
         "stats_interval": stats_interval,
     }
 
@@ -566,12 +507,10 @@ def run_scan(mode_key: str, stocks_to_scan: list,
         results, timestamp, failed_records
 
     `fetch_and_analyze(record) -> (status, analysis)` where status is one of
-    'ok' | 'filtered' | 'failed'. `record` is a TickerRecord (symbol/name/
-    yf_symbol/exchange) so every mode's core logic gets the company name for
-    free without re-deriving it. This function owns everything that must
-    behave identically across modes: progress bar, batching, checkpointing,
-    stats, and non-blocking behaviour (no long blocking sleeps that would
-    make the whole app feel frozen — "no lagging").
+    'ok' | 'filtered' | 'failed'. Owns everything that must behave
+    consistently: progress bar, batching/pausing, checkpointing, stats, and
+    non-blocking behaviour (no long blocking sleeps that would make the
+    whole app feel frozen).
     """
     set_state(mode_key, "results", None)
     pop_state(mode_key, "timestamp")
@@ -607,25 +546,14 @@ def run_scan(mode_key: str, stocks_to_scan: list,
     max_workers = min(rate_cfg["max_workers"], len(scan_universe)) if scan_universe else 1
     status_text.info(f"⚡ Concurrent scan: {max_workers} workers × {len(scan_universe)} stocks remaining")
 
-    # Checkpointing after *every* stock used to mean writing the whole
-    # (ever-growing) results/scanned-symbols JSON back to disk once per
-    # stock — fine for a 50-stock Quick Scan, but O(n²) total bytes written
-    # on a ~8,000-stock Full Scan, which is exactly the kind of "lagging"
-    # this rewrite is meant to kill. Checkpoint on a time/count throttle
-    # instead — worst case a crash loses the last few seconds of progress,
-    # which resume already tolerates fine.
+    # Checkpointing after *every* stock means rewriting the whole
+    # (ever-growing) results/scanned-symbols JSON once per stock — fine for
+    # a 50-stock Quick Scan, O(n²) total bytes written on a full-universe
+    # scan. Throttle on a time/count basis instead; worst case a crash loses
+    # the last few seconds, which resume already tolerates.
     _checkpoint_every = max(1, total // 100 if total else 1)
     _last_checkpoint_ts = time.time()
 
-    # Live-status panel below. Previously the only visibility into a running
-    # scan was the aggregate progress bar + a periodic (every stats_interval-th
-    # stock) stats line -- every 429 / cooldown / retry yf_ratelimit hits only
-    # went to the server log (invisible in the app itself, and on Streamlit
-    # Cloud only reachable by opening the separate log viewer). This surfaces
-    # yf_ratelimit's rate-limit events inside the app, updating live as the
-    # scan runs -- kept to a single current-status line rather than a growing
-    # per-symbol list, since most stocks get filtered out by design and an
-    # itemized log of that is just noise, not "live status."
     _last_live_update = 0.0
     _last_symbol = {"symbol": None, "icon": "", "label": ""}
 
@@ -682,7 +610,6 @@ def run_scan(mode_key: str, stocks_to_scan: list,
                     _last_symbol.update(symbol=rec["symbol"], icon="❌", label="failed")
                 else:
                     _last_symbol.update(symbol=rec["symbol"], icon="⏭️", label="filtered out")
-                # 'filtered' -> counted implicitly (completed - len(results) - failed)
 
                 _now = time.time()
                 if (completed % _checkpoint_every == 0 or completed == total
@@ -767,7 +694,7 @@ def run_scan(mode_key: str, stocks_to_scan: list,
     st.rerun()
 
 
-# ── CSV export (always includes company Name) ───────────────────────────────
+# ── CSV export ────────────────────────────────────────────────────────────
 def download_buttons(mode_key: str, filtered_df: pd.DataFrame, full_df: pd.DataFrame, file_prefix: str) -> None:
     st.markdown("---")
     st.subheader("💾 Download Results")
@@ -792,7 +719,7 @@ def download_buttons(mode_key: str, filtered_df: pd.DataFrame, full_df: pd.DataF
         )
 
 
-# ── Shared CSS + page chrome (call once, from the top-level entrypoint) ────
+# ── Shared CSS + page chrome ────────────────────────────────────────────
 def inject_base_css() -> None:
     st.markdown("""<style>
 .main-header{font-size:2.5rem;font-weight:700;color:#1f77b4;text-align:center;margin-bottom:1rem}

@@ -192,18 +192,17 @@ def _fetch_bse_day(day: date) -> "pd.DataFrame | None":
     in the SEBI-mandated UDiFF schema shared with NSE, confirmed against a
     real downloaded file (2026-09-02).
 
-    Two things that looked plausible but were wrong before actually seeing
-    a file, now fixed:
-      • Join key is 'FinInstrmId' (numeric scrip code, e.g. 500325 for
-        RELIANCE) — NOT 'TckrSymb', which turned out to hold BSE's alpha
-        short name ("RELIANCE") rather than the code tickers.py's ".BO"
-        roots use.
-      • 'SctySrs' holds BSE's trading *group* (A/B/T/X/Z/...), not an
-        EQ/BE series code — filtering it the way the NSE fetch filters
-        SERIES silently dropped every row. This file (Sgmt=CM,
-        FinInstrmTp=STK only) is already restricted to cash-market equity
-        with no other instrument types mixed in, so no series filter is
-        needed here at all.
+    Join key is 'TckrSymb' (the BSE ticker symbol, e.g. "ABB") — this
+    matches tickers.py's yf_symbol, which is now built as
+    f"{TckrSymb}.BO" (see tickers.py's load_bse_universe). The numeric
+    scrip code ('FinInstrmId') is also kept as a 'code' column in case a
+    caller needs to match on it instead.
+
+    'SctySrs' holds BSE's trading *group* (A/B/T/X/Z/...), not an EQ/BE
+    series code — filtering it the way the NSE fetch filters SERIES would
+    silently drop every row. This file (Sgmt=CM, FinInstrmTp=STK only) is
+    already restricted to cash-market equity with no other instrument
+    types mixed in, so no series filter is needed here at all.
     """
     yyyymmdd = day.strftime("%Y%m%d")
     referer = "https://www.bseindia.com/markets/marketinfo/bhavcopy"
@@ -220,17 +219,17 @@ def _fetch_bse_day(day: date) -> "pd.DataFrame | None":
         df = pd.read_csv(io.BytesIO(resp.content))
         df.columns = [c.strip() for c in df.columns]
         rename = {
-            "FinInstrmId": "symbol", "OpnPric": "open", "HghPric": "high",
-            "LwPric": "low", "ClsPric": "close", "TtlTradgVol": "volume",
-            "PrvsClsgPric": "prev_close",
+            "TckrSymb": "symbol", "FinInstrmId": "code", "OpnPric": "open",
+            "HghPric": "high", "LwPric": "low", "ClsPric": "close",
+            "TtlTradgVol": "volume", "PrvsClsgPric": "prev_close",
         }
         df = df.rename(columns=rename)
         needed = ["symbol", "open", "high", "low", "close", "volume"]
         if not all(c in df.columns for c in needed):
             return None
-        keep = needed + (["prev_close"] if "prev_close" in df.columns else [])
+        keep = needed + [c for c in ("prev_close", "code") if c in df.columns]
         df = df[keep]
-        df["symbol"] = df["symbol"].astype(str).str.strip()
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df["date"] = day.isoformat()

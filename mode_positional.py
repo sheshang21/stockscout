@@ -1,17 +1,22 @@
 """
 mode_positional.py — Positional / Ultra-Strict long-term value scanner.
 
-This is the CORE LOGIC that makes this mode distinct from the two intraday
-modes: fetch_stock_data() (3-month daily history + annual/quarterly
-financials) and analyze_stock() (the 14-criterion, 250-point fundamentals +
-technicals scoring system). Everything else — exchange/scan-mode selection,
-rate limiting, checkpointing, the results table shell, filters, CSV export —
-comes from scanner_common so all 3 modes share it exactly.
+Every threshold that decides a scoring band — price range, growth %,
+cash/revenue ratios, RSI/MACD/BB/volume bounds, operator-detection
+sensitivity, everything — is a sidebar-adjustable parameter in PARAMS,
+built by _params_ui() below. The point value *awarded* for each band is
+still a fixed constant (that's the "score" the app assigns once a stock
+falls in a band); it's the cutoffs that decide which band a stock falls
+into that are fully adjustable.
+
+fetch_stock_data() (history + financials) and analyze_stock() (the
+scoring engine) are the CORE LOGIC that makes this mode distinct.
+Everything else — exchange/scan-mode selection, rate limiting,
+checkpointing, results table, filters, CSV export — comes from
+scanner_common.
 """
 
 from __future__ import annotations
-
-import time
 
 import numpy as np
 import pandas as pd
@@ -35,33 +40,195 @@ SECTOR_MAP = {
     'JSWSTEEL': 'Metals', 'M&M': 'Auto', 'TECHM': 'IT', 'ADANIENT': 'Conglomerate', 'ADANIPORTS': 'Infrastructure',
 }
 
-_CACHE_TTL_S = 300  # fundamentals barely move intraday; long TTL is fine and keeps repeat scans fast
+
+# ── Adjustable parameter schema ──────────────────────────────────────────
+# (key, label, default, min, max, step, kind)  kind: 'i' int / 'f' float
+_PARAM_GROUPS: list[tuple[str, list[tuple], bool]] = [
+    ("🎯 Qualification Score Thresholds", [
+        ("th_exceptional", "Exceptional (≥)", 180, 100, 250, 10, 'i'),
+        ("th_prime", "Prime (≥)", 160, 100, 250, 10, 'i'),
+        ("th_excellent", "Excellent (≥)", 140, 100, 250, 10, 'i'),
+        ("th_strong", "Strong (≥)", 120, 50, 200, 10, 'i'),
+        ("th_good", "Good (≥)", 100, 50, 200, 10, 'i'),
+        ("th_watchlist", "Watchlist (≥)", 80, 0, 150, 10, 'i'),
+    ], True),
+    ("📊 Market Cap Scoring (₹ Cr)", [
+        ("mcap_large", "Large Cap cutoff (≥)", 20000, 1000, 200000, 1000, 'i'),
+        ("mcap_mid", "Small-Mid Cap cutoff (≥)", 5000, 500, 100000, 500, 'i'),
+    ], False),
+    ("📈 Revenue Growth (%)", [
+        ("rev_exceptional_yoy", "Exceptional YoY (≥)", 25.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_exceptional_qoq", "Exceptional QoQ (≥)", 15.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_excellent_yoy", "Excellent YoY (≥)", 20.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_excellent_qoq", "Excellent QoQ (≥)", 10.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_strong_yoy", "Strong YoY (≥)", 15.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_strong_qoq", "Strong QoQ (≥)", 8.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_good_yoy", "Good YoY (≥)", 10.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_good_qoq", "Good QoQ (≥)", 5.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_moderate_yoy", "Moderate YoY, no QoQ data (≥)", 5.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_solo_strong", "YoY-only: Strong (≥)", 20.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_solo_good", "YoY-only: Good (≥)", 12.0, -50.0, 200.0, 1.0, 'f'),
+        ("rev_solo_moderate", "YoY-only: Moderate (≥)", 5.0, -50.0, 200.0, 1.0, 'f'),
+    ], False),
+    ("💹 Profit Growth (%)", [
+        ("profit_exceptional_yoy", "Exceptional YoY (≥)", 30.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_exceptional_qoq", "Exceptional QoQ (≥)", 20.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_excellent_yoy", "Excellent YoY (≥)", 25.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_excellent_qoq", "Excellent QoQ (≥)", 15.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_strong_yoy", "Strong YoY (≥)", 20.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_strong_qoq", "Strong QoQ (≥)", 10.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_good_yoy", "Good YoY (≥)", 12.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_good_qoq", "Good QoQ (≥)", 6.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_moderate_yoy", "Moderate YoY, no QoQ data (≥)", 5.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_solo_strong", "YoY-only: Strong (≥)", 25.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_solo_good", "YoY-only: Good (≥)", 15.0, -50.0, 300.0, 1.0, 'f'),
+        ("profit_solo_moderate", "YoY-only: Moderate (≥)", 8.0, -50.0, 300.0, 1.0, 'f'),
+    ], False),
+    ("💵 Profit Margin (%)", [
+        ("margin_excellent", "Excellent (≥)", 20.0, 0.0, 100.0, 1.0, 'f'),
+        ("margin_verygood", "Very Good (≥)", 15.0, 0.0, 100.0, 1.0, 'f'),
+        ("margin_good", "Good (≥)", 10.0, 0.0, 100.0, 1.0, 'f'),
+        ("margin_average", "Average (≥)", 5.0, 0.0, 100.0, 1.0, 'f'),
+    ], False),
+    ("🏦 Cash & Revenue Quality", [
+        ("cash_to_mcap_strong", "Cash/MCap % — Strong (≥)", 15.0, 0.0, 200.0, 1.0, 'f'),
+        ("cash_to_mcap_good", "Cash/MCap % — Good (≥)", 8.0, 0.0, 200.0, 1.0, 'f'),
+        ("rev_to_mcap_strong", "Revenue/MCap ratio — Strong (≥)", 1.0, 0.0, 10.0, 0.1, 'f'),
+        ("rev_to_mcap_good", "Revenue/MCap ratio — Good (≥)", 0.5, 0.0, 10.0, 0.1, 'f'),
+    ], False),
+    ("🏛️ FII/DII Activity Score", [
+        ("fii_strong", "Strong Buying (≥)", 15, -50, 50, 1, 'i'),
+        ("fii_good", "Good Buying (≥)", 10, -50, 50, 1, 'i'),
+        ("fii_accum", "Accumulation (≥)", 5, -50, 50, 1, 'i'),
+        ("fii_neutral", "Neutral (≥)", 0, -50, 50, 1, 'i'),
+    ], False),
+    ("📐 Consolidation — Weekly Change (%)", [
+        ("consol_perfect_low", "Perfect base — low", -2.0, -50.0, 50.0, 0.1, 'f'),
+        ("consol_perfect_high", "Perfect base — high", 0.3, -50.0, 50.0, 0.1, 'f'),
+        ("consol_pullback_low", "Healthy pullback — low", -3.5, -50.0, 50.0, 0.1, 'f'),
+        ("consol_pullback_high", "Healthy pullback — high", -2.0, -50.0, 50.0, 0.1, 'f'),
+        ("consol_breakout_low", "Early breakout — low", 0.3, -50.0, 50.0, 0.1, 'f'),
+        ("consol_breakout_high", "Early breakout — high", 1.5, -50.0, 50.0, 0.1, 'f'),
+        ("consol_rallied_above", "Already rallied, above", 4.0, -50.0, 50.0, 0.1, 'f'),
+    ], False),
+    ("📉 RSI", [
+        ("rsi_period", "RSI period", 14, 2, 60, 1, 'i'),
+        ("rsi_low", "Lower bound (perfect entry)", 32, 0, 100, 1, 'i'),
+        ("rsi_high", "Upper bound (perfect entry)", 38, 0, 100, 1, 'i'),
+        ("rsi_band2_offset", "Momentum band offset", 7, 0, 50, 1, 'i'),
+        ("rsi_band3_offset", "Early-momentum band offset", 12, 0, 50, 1, 'i'),
+        ("rsi_band4_offset", "Neutral band offset", 17, 0, 50, 1, 'i'),
+        ("rsi_overbought_offset", "Overbought cutoff offset", 24, 0, 50, 1, 'i'),
+    ], False),
+    ("📊 MACD", [
+        ("macd_fast", "Fast EMA period", 12, 2, 50, 1, 'i'),
+        ("macd_slow", "Slow EMA period", 26, 5, 100, 1, 'i'),
+        ("macd_perfect_low", "Perfect crossover — low", -1.0, -20.0, 20.0, 0.5, 'f'),
+        ("macd_perfect_high", "Perfect crossover — high", 1.0, -20.0, 20.0, 0.5, 'f'),
+        ("macd_early_bullish_high", "Early bullish — high", 3.0, -20.0, 20.0, 0.5, 'f'),
+        ("macd_about_turn_low", "About to turn — low", -3.0, -20.0, 20.0, 0.5, 'f'),
+        ("macd_extended_above", "Extended, above", 6.0, -20.0, 20.0, 0.5, 'f'),
+    ], False),
+    ("📶 Bollinger Bands (%B)", [
+        ("bb_period", "Period", 20, 5, 60, 1, 'i'),
+        ("bb_std_mult", "Std-dev multiplier", 2.0, 0.5, 4.0, 0.1, 'f'),
+        ("bb_lower_low", "Lower-band bounce — low", 8.0, 0.0, 100.0, 1.0, 'f'),
+        ("bb_lower_high", "Lower-band bounce — high", 20.0, 0.0, 100.0, 1.0, 'f'),
+        ("bb_below_mid_high", "Below middle — high", 30.0, 0.0, 100.0, 1.0, 'f'),
+        ("bb_middle_high", "Middle zone — high", 45.0, 0.0, 100.0, 1.0, 'f'),
+        ("bb_upper_above", "Upper band, above", 65.0, 0.0, 100.0, 1.0, 'f'),
+    ], False),
+    ("📦 Volume Multiple", [
+        ("vol_window", "Averaging window (days)", 20, 5, 90, 1, 'i'),
+        ("vol_perfect_low", "Perfect accumulation — low", 1.3, 0.0, 10.0, 0.1, 'f'),
+        ("vol_perfect_high", "Perfect accumulation — high", 1.8, 0.0, 10.0, 0.1, 'f'),
+        ("vol_building_high", "Building interest — high", 2.2, 0.0, 10.0, 0.1, 'f'),
+        ("vol_toohigh_above", "Too high, above", 2.8, 0.0, 10.0, 0.1, 'f'),
+        ("vol_avg_low", "Average — low", 1.0, 0.0, 10.0, 0.1, 'f'),
+    ], False),
+    ("📅 Today's Price Change (%)", [
+        ("today_perfect_low", "Perfect entry — low", -1.5, -50.0, 50.0, 0.1, 'f'),
+        ("today_perfect_high", "Perfect entry — high", 0.3, -50.0, 50.0, 0.1, 'f'),
+        ("today_early_high", "Early move — high", 1.2, -50.0, 50.0, 0.1, 'f'),
+        ("today_dip_low", "Dip — low", -2.5, -50.0, 50.0, 0.1, 'f'),
+        ("today_rallied_above", "Already rallied, above", 2.5, -50.0, 50.0, 0.1, 'f'),
+    ], False),
+    ("🗓️ Monthly Trend (%)", [
+        ("monthly_recover_low", "Recovering from dip — low", -8.0, -80.0, 80.0, 0.5, 'f'),
+        ("monthly_recover_high", "Recovering from dip — high", -2.0, -80.0, 80.0, 0.5, 'f'),
+        ("monthly_base_high", "Base building — high", 2.0, -80.0, 80.0, 0.5, 'f'),
+        ("monthly_moderate_high", "Moderate gain — high", 6.0, -80.0, 80.0, 0.5, 'f'),
+        ("monthly_extended_above", "Extended, above", 10.0, -80.0, 80.0, 0.5, 'f'),
+    ], False),
+    ("📆 3-Month Performance (%)", [
+        ("three_m_correction_low", "Perfect correction — low", -15.0, -100.0, 100.0, 1.0, 'f'),
+        ("three_m_correction_high", "Perfect correction — high", -5.0, -100.0, 100.0, 1.0, 'f'),
+        ("three_m_sideways_high", "Sideways base — high", 5.0, -100.0, 100.0, 1.0, 'f'),
+        ("three_m_moderate_high", "Moderate rise — high", 15.0, -100.0, 100.0, 1.0, 'f'),
+        ("three_m_overextended_above", "Overextended, above", 25.0, -100.0, 100.0, 1.0, 'f'),
+    ], False),
+    ("🚀 Upside Potential (Price Range)", [
+        ("upside_move_pct", "Target move — % of price", 10.0, 0.0, 100.0, 0.5, 'f'),
+        ("upside_floor_rs", "Minimum target move (₹)", 20.0, 0.0, 1000.0, 5.0, 'f'),
+        ("upside_excellent", "Excellent — % upside (≥)", 12.0, 0.0, 100.0, 0.5, 'f'),
+        ("upside_verygood", "Very Good — % upside (≥)", 10.0, 0.0, 100.0, 0.5, 'f'),
+        ("upside_good", "Good — % upside (≥)", 8.0, 0.0, 100.0, 0.5, 'f'),
+    ], False),
+    ("🚨 Operator / Pump Detection", [
+        ("vol_spike_extreme_mult", "Extreme volume spike, ×avg", 5.0, 1.0, 20.0, 0.5, 'f'),
+        ("vol_spike_high_mult", "High volume spike, ×avg", 3.0, 1.0, 20.0, 0.5, 'f'),
+        ("swing_extreme_pct", "Extreme daily swing (%)", 8.0, 0.0, 50.0, 0.5, 'f'),
+        ("swing_avg_extreme_pct", "Extreme swing — avg floor (%)", 3.0, 0.0, 50.0, 0.5, 'f'),
+        ("swing_high_pct", "High daily swing (%)", 5.0, 0.0, 50.0, 0.5, 'f'),
+        ("swing_avg_high_pct", "High swing — avg floor (%)", 2.0, 0.0, 50.0, 0.5, 'f'),
+        ("circuit_change_pct", "Circuit-hit day change (%)", 9.0, 0.0, 30.0, 0.5, 'f'),
+        ("circuit_hits_extreme", "Circuit hits — extreme (≥)", 3, 1, 20, 1, 'i'),
+        ("circuit_hits_high", "Circuit hits — high (≥)", 2, 1, 20, 1, 'i'),
+        ("operated_risk_cutoff", "Risk score — flag as OPERATED (≥)", 40, 0, 100, 5, 'i'),
+    ], False),
+    ("🗄️ Data Window", [
+        ("lookback_trading_days", "Daily-history lookback (trading days)", 65, 20, 250, 5, 'i'),
+        ("cache_ttl_sec", "Fundamentals cache TTL (sec)", 300, 30, 3600, 30, 'i'),
+    ], False),
+]
+
+
+def _params_ui(mode_key: str) -> dict:
+    params: dict = {}
+    for title, rows, expanded in _PARAM_GROUPS:
+        with st.sidebar.expander(title, expanded=expanded):
+            for key, label, default, mn, mx, step, kind in rows:
+                if kind == 'i':
+                    params[key] = st.number_input(label, min_value=int(mn), max_value=int(mx),
+                                                    value=int(default), step=int(step),
+                                                    key=sskey(mode_key, f"p_{key}"))
+                else:
+                    params[key] = st.number_input(label, min_value=float(mn), max_value=float(mx),
+                                                    value=float(default), step=float(step),
+                                                    key=sskey(mode_key, f"p_{key}"))
+    return params
 
 
 # ── CORE LOGIC: fetch ────────────────────────────────────────────────────
-def fetch_stock_data(yf_symbol: str):
+def fetch_stock_data(yf_symbol: str, params: dict):
     """History for technicals comes from NSE/BSE's own bhavcopy first (see
-    bhavcopy.py) — it's free EOD data with no Yahoo rate limit attached, so
-    using it removes this call from Yahoo's load entirely instead of just
-    retrying it more politely. Falls back to yfinance's ticker.history() if
-    bhavcopy has no usable data for this symbol (unrecognized exchange
-    suffix, a fetch failure, or too little history). Financials/balance
-    sheet still come from yfinance — bhavcopy has no such data. ticker.info
-    is intentionally never called — it's the most throttled Yahoo endpoint
-    and everything here is derivable from the financial statements +
-    fast_info instead."""
+    bhavcopy.py) — free EOD data with no Yahoo rate limit attached. Falls
+    back to yfinance's ticker.history() if bhavcopy has no usable data.
+    Financials/balance sheet still come from yfinance. ticker.info is
+    intentionally never called — the most throttled Yahoo endpoint, and
+    everything here is derivable from the financial statements + fast_info."""
     if sc.is_known_dead(yf_symbol):
         return None
 
     cache_key = f"{MODE_KEY}:{yf_symbol}"
-    cached = sc.cache_get(cache_key, _CACHE_TTL_S)
+    cached = sc.cache_get(cache_key, params["cache_ttl_sec"])
     if cached is not None:
         return cached
 
     try:
         ticker = yf.Ticker(yf_symbol)
 
-        bhav = bhavcopy.get_daily_series(yf_symbol, trading_days=65)
+        bhav = bhavcopy.get_daily_series(yf_symbol, trading_days=params["lookback_trading_days"])
         if bhav is not None:
             closes = bhav['close'].values
             highs = bhav['high'].values
@@ -152,10 +319,10 @@ def fetch_stock_data(yf_symbol: str):
         historical_data = get_historical_financials_from_data(annual_inc, annual_bs, market_cap)
 
         fii_dii_activity = indicators.detect_institutional_activity(volumes, closes)
-        rsi = indicators.rsi(closes)
-        macd = indicators.macd(closes)
-        bb_position = indicators.bollinger_position(closes)
-        vol_multiple = indicators.volume_multiple(volumes)
+        rsi = indicators.rsi(closes, period=params["rsi_period"])
+        macd = indicators.macd(closes, fast=params["macd_fast"], slow=params["macd_slow"])
+        bb_position = indicators.bollinger_position(closes, period=params["bb_period"], std_mult=params["bb_std_mult"])
+        vol_multiple = indicators.volume_multiple(volumes, window=params["vol_window"])
         trend = indicators.detect_trend(closes)
 
         weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] != 0 else 0
@@ -228,7 +395,8 @@ def fetch_live_price(yf_symbol: str):
 
 
 # ── CORE LOGIC: score ───────────────────────────────────────────────────
-def analyze_stock(data, min_market_cap, thresholds):
+def analyze_stock(data, min_market_cap, min_price, max_price, p):
+    """`p` is the full adjustable-parameters dict from _params_ui()."""
     try:
         if not data:
             return None
@@ -236,17 +404,27 @@ def analyze_stock(data, min_market_cap, thresholds):
         price = data['price']; change = data['change']; rsi = data['rsi']; macd = data['macd']
         bb = data['bb_position']; vol = data['vol_multiple']; trend = data['trend']; closes = data['closes']
 
+        if price < min_price or price > max_price:
+            return None
+
         market_cap = data['market_cap'] / 10000000 if data['market_cap'] else 0
         if market_cap < min_market_cap:
             return None
 
-        is_operated, operator_flags, operator_risk = indicators.detect_operator_activity(closes, data['volumes'])
+        is_operated, operator_flags, operator_risk = indicators.detect_operator_activity(
+            closes, data['volumes'],
+            vol_spike_extreme_mult=p["vol_spike_extreme_mult"], vol_spike_high_mult=p["vol_spike_high_mult"],
+            swing_extreme_pct=p["swing_extreme_pct"], swing_avg_extreme_pct=p["swing_avg_extreme_pct"],
+            swing_high_pct=p["swing_high_pct"], swing_avg_high_pct=p["swing_avg_high_pct"],
+            circuit_change_pct=p["circuit_change_pct"], circuit_hits_extreme=p["circuit_hits_extreme"],
+            circuit_hits_high=p["circuit_hits_high"], operated_risk_cutoff=p["operated_risk_cutoff"],
+        )
 
         weekly_change = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] != 0 else 0
         monthly_change = ((closes[-1] - closes[-20]) / closes[-20]) * 100 if len(closes) >= 20 and closes[-20] != 0 else 0
         three_month_change = ((closes[-1] - closes[0]) / closes[0]) * 100 if len(closes) >= 5 and closes[0] != 0 else 0
 
-        potential_rs = max(20, price * 0.10)
+        potential_rs = max(p["upside_floor_rs"], price * (p["upside_move_pct"] / 100.0))
         potential_pct = (potential_rs / price) * 100 if price != 0 else 0
 
         score = 0
@@ -266,10 +444,10 @@ def analyze_stock(data, min_market_cap, thresholds):
             criteria.append(f'⚠️ MODERATE RISK: Some volatility flags (Risk: {operator_risk}/100) [-12 pts]')
 
         # 1. MARKET CAP (15 pts)
-        if market_cap >= 20000:
+        if market_cap >= p["mcap_large"]:
             score += 15
             criteria.append(f'✅ Market Cap: Large Cap (₹{market_cap:.0f} Cr) [15 pts]')
-        elif market_cap >= 5000:
+        elif market_cap >= p["mcap_mid"]:
             score += 7
             criteria.append(f'⚠ Market Cap: Small-Mid Cap (₹{market_cap:.0f} Cr) [7 pts]')
         else:
@@ -279,24 +457,24 @@ def analyze_stock(data, min_market_cap, thresholds):
         yoy_rev = data['yoy_revenue_growth']
         qoq_rev = data['qoq_revenue_growth']
         if yoy_rev is not None and qoq_rev is not None:
-            if yoy_rev >= 25 and qoq_rev >= 15:
+            if yoy_rev >= p["rev_exceptional_yoy"] and qoq_rev >= p["rev_exceptional_qoq"]:
                 score += 25; criteria.append(f'✅ Revenue: EXCEPTIONAL Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [25 pts]')
-            elif yoy_rev >= 20 and qoq_rev >= 10:
+            elif yoy_rev >= p["rev_excellent_yoy"] and qoq_rev >= p["rev_excellent_qoq"]:
                 score += 22; criteria.append(f'✅ Revenue: Excellent Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [22 pts]')
-            elif yoy_rev >= 15 and qoq_rev >= 8:
+            elif yoy_rev >= p["rev_strong_yoy"] and qoq_rev >= p["rev_strong_qoq"]:
                 score += 18; criteria.append(f'✅ Revenue: Strong Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [18 pts]')
-            elif yoy_rev >= 10 and qoq_rev >= 5:
+            elif yoy_rev >= p["rev_good_yoy"] and qoq_rev >= p["rev_good_qoq"]:
                 score += 12; criteria.append(f'⚠ Revenue: Good Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [12 pts]')
-            elif yoy_rev >= 5:
+            elif yoy_rev >= p["rev_moderate_yoy"]:
                 score += 5; criteria.append(f'⚠ Revenue: Moderate Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [5 pts]')
             else:
                 criteria.append(f'❌ Revenue: Weak/Negative Growth (YoY: {yoy_rev:.1f}%, QoQ: {qoq_rev:.1f}%) [0 pts]')
         elif yoy_rev is not None:
-            if yoy_rev >= 20:
+            if yoy_rev >= p["rev_solo_strong"]:
                 score += 20; criteria.append(f'✅ Revenue: Strong YoY Growth ({yoy_rev:.1f}%) [20 pts]')
-            elif yoy_rev >= 12:
+            elif yoy_rev >= p["rev_solo_good"]:
                 score += 15; criteria.append(f'✅ Revenue: Good YoY Growth ({yoy_rev:.1f}%) [15 pts]')
-            elif yoy_rev >= 5:
+            elif yoy_rev >= p["rev_solo_moderate"]:
                 score += 8; criteria.append(f'⚠ Revenue: Moderate Growth ({yoy_rev:.1f}%) [8 pts]')
             else:
                 criteria.append(f'❌ Revenue: Weak Growth ({yoy_rev:.1f}%) [0 pts]')
@@ -308,24 +486,24 @@ def analyze_stock(data, min_market_cap, thresholds):
         qoq_profit = data['qoq_profit_growth']
         profit_margin = data['profit_margin']
         if yoy_profit is not None and qoq_profit is not None:
-            if yoy_profit >= 30 and qoq_profit >= 20:
+            if yoy_profit >= p["profit_exceptional_yoy"] and qoq_profit >= p["profit_exceptional_qoq"]:
                 score += 25; criteria.append(f'✅ Profit: EXCEPTIONAL Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [25 pts]')
-            elif yoy_profit >= 25 and qoq_profit >= 15:
+            elif yoy_profit >= p["profit_excellent_yoy"] and qoq_profit >= p["profit_excellent_qoq"]:
                 score += 22; criteria.append(f'✅ Profit: Excellent Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [22 pts]')
-            elif yoy_profit >= 20 and qoq_profit >= 10:
+            elif yoy_profit >= p["profit_strong_yoy"] and qoq_profit >= p["profit_strong_qoq"]:
                 score += 18; criteria.append(f'✅ Profit: Strong Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [18 pts]')
-            elif yoy_profit >= 12 and qoq_profit >= 6:
+            elif yoy_profit >= p["profit_good_yoy"] and qoq_profit >= p["profit_good_qoq"]:
                 score += 12; criteria.append(f'⚠ Profit: Good Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [12 pts]')
-            elif yoy_profit >= 5:
+            elif yoy_profit >= p["profit_moderate_yoy"]:
                 score += 5; criteria.append(f'⚠ Profit: Moderate Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [5 pts]')
             else:
                 criteria.append(f'❌ Profit: Weak/Negative Growth (YoY: {yoy_profit:.1f}%, QoQ: {qoq_profit:.1f}%) [0 pts]')
         elif yoy_profit is not None:
-            if yoy_profit >= 25:
+            if yoy_profit >= p["profit_solo_strong"]:
                 score += 20; criteria.append(f'✅ Profit: Strong YoY Growth ({yoy_profit:.1f}%) [20 pts]')
-            elif yoy_profit >= 15:
+            elif yoy_profit >= p["profit_solo_good"]:
                 score += 15; criteria.append(f'✅ Profit: Good YoY Growth ({yoy_profit:.1f}%) [15 pts]')
-            elif yoy_profit >= 8:
+            elif yoy_profit >= p["profit_solo_moderate"]:
                 score += 8; criteria.append(f'⚠ Profit: Moderate Growth ({yoy_profit:.1f}%) [8 pts]')
             else:
                 criteria.append(f'❌ Profit: Weak Growth ({yoy_profit:.1f}%) [0 pts]')
@@ -335,164 +513,169 @@ def analyze_stock(data, min_market_cap, thresholds):
         # 4. PROFIT MARGIN (15 pts)
         if profit_margin is not None:
             pm = profit_margin * 100
-            if pm >= 20:
+            if pm >= p["margin_excellent"]:
                 score += 15; criteria.append(f'✅ Profit Margin: Excellent ({pm:.1f}%) [15 pts]')
-            elif pm >= 15:
+            elif pm >= p["margin_verygood"]:
                 score += 12; criteria.append(f'✅ Profit Margin: Very Good ({pm:.1f}%) [12 pts]')
-            elif pm >= 10:
+            elif pm >= p["margin_good"]:
                 score += 10; criteria.append(f'✅ Profit Margin: Good ({pm:.1f}%) [10 pts]')
-            elif pm >= 5:
+            elif pm >= p["margin_average"]:
                 score += 5; criteria.append(f'⚠ Profit Margin: Average ({pm:.1f}%) [5 pts]')
             else:
                 criteria.append(f'❌ Profit Margin: Low ({pm:.1f}%) [0 pts]')
         else:
             criteria.append('❌ Profit Margin: Data not available [0 pts]')
 
-        # 5. FII/DII ACTIVITY (20 pts)
+        # 5. CASH & REVENUE QUALITY (15 pts)
+        cash_pct = data.get('cash_on_hand_to_mcap', 0)
+        rev_ratio = data.get('latest_fy_revenue_to_mcap', 0)
+        if cash_pct >= p["cash_to_mcap_strong"] and rev_ratio >= p["rev_to_mcap_strong"]:
+            score += 15; criteria.append(f'✅ Cash/Revenue: Strong (Cash/MCap: {cash_pct:.1f}%, Rev/MCap: {rev_ratio:.2f}x) [15 pts]')
+        elif cash_pct >= p["cash_to_mcap_good"] or rev_ratio >= p["rev_to_mcap_good"]:
+            score += 8; criteria.append(f'⚠ Cash/Revenue: Good (Cash/MCap: {cash_pct:.1f}%, Rev/MCap: {rev_ratio:.2f}x) [8 pts]')
+        else:
+            criteria.append(f'❌ Cash/Revenue: Weak (Cash/MCap: {cash_pct:.1f}%, Rev/MCap: {rev_ratio:.2f}x) [0 pts]')
+
+        # 6. FII/DII ACTIVITY (20 pts)
         fii_score = data['fii_dii_score']
-        if fii_score >= 15:
+        if fii_score >= p["fii_strong"]:
             score += 20; criteria.append(f'✅ FII/DII: Strong Buying ({fii_score}) [20 pts]')
-        elif fii_score >= 10:
+        elif fii_score >= p["fii_good"]:
             score += 15; criteria.append(f'✅ FII/DII: Good Buying ({fii_score}) [15 pts]')
-        elif fii_score >= 5:
+        elif fii_score >= p["fii_accum"]:
             score += 10; criteria.append(f'✅ FII/DII: Accumulation ({fii_score}) [10 pts]')
-        elif fii_score >= 0:
+        elif fii_score >= p["fii_neutral"]:
             score += 5; criteria.append(f'⚠ FII/DII: Neutral ({fii_score}) [5 pts]')
         else:
             criteria.append(f'❌ FII/DII: Selling ({fii_score}) [0 pts]')
 
-        # 6. CONSOLIDATION (20 pts)
-        if -2 <= weekly_change <= 0.3:
+        # 7. CONSOLIDATION (20 pts)
+        if p["consol_perfect_low"] <= weekly_change <= p["consol_perfect_high"]:
             score += 20; criteria.append(f'✅ Consolidation: Perfect base ({weekly_change:+.1f}% weekly) [20 pts]')
-        elif -3.5 <= weekly_change < -2:
+        elif p["consol_pullback_low"] <= weekly_change < p["consol_pullback_high"]:
             score += 18; criteria.append(f'✅ Consolidation: Healthy pullback ({weekly_change:+.1f}% weekly) [18 pts]')
-        elif 0.3 < weekly_change <= 1.5:
+        elif p["consol_breakout_low"] < weekly_change <= p["consol_breakout_high"]:
             score += 15; criteria.append(f'✅ Consolidation: Early breakout ({weekly_change:+.1f}% weekly) [15 pts]')
-        elif weekly_change > 4:
+        elif weekly_change > p["consol_rallied_above"]:
             criteria.append(f'❌ Already rallied ({weekly_change:+.1f}% weekly) [0 pts]')
         else:
             score += 5; criteria.append(f'⚠ Consolidation: Weak ({weekly_change:+.1f}% weekly) [5 pts]')
 
-        # 7. RSI (20 pts)
-        rsi_low = thresholds['rsi_low']; rsi_high = thresholds['rsi_high']
+        # 8. RSI (20 pts)
+        rsi_low = p['rsi_low']; rsi_high = p['rsi_high']
         if rsi_low <= rsi <= rsi_high:
             score += 20; criteria.append(f'✅ RSI: Perfect oversold entry ({rsi:.0f}) [20 pts]')
-        elif rsi_high < rsi <= rsi_high + 7:
+        elif rsi_high < rsi <= rsi_high + p["rsi_band2_offset"]:
             score += 17; criteria.append(f'✅ RSI: Building momentum ({rsi:.0f}) [17 pts]')
-        elif rsi_high + 7 < rsi <= rsi_high + 12:
+        elif rsi_high + p["rsi_band2_offset"] < rsi <= rsi_high + p["rsi_band3_offset"]:
             score += 12; criteria.append(f'✅ RSI: Early momentum ({rsi:.0f}) [12 pts]')
-        elif rsi_high + 12 < rsi <= rsi_high + 17:
+        elif rsi_high + p["rsi_band3_offset"] < rsi <= rsi_high + p["rsi_band4_offset"]:
             score += 8; criteria.append(f'⚠ RSI: Neutral ({rsi:.0f}) [8 pts]')
-        elif rsi > rsi_high + 24:
+        elif rsi > rsi_high + p["rsi_overbought_offset"]:
             criteria.append(f'❌ RSI: Overbought ({rsi:.0f}) [0 pts]')
         else:
             score += 5; criteria.append(f'⚠ RSI: Moderate ({rsi:.0f}) [5 pts]')
 
-        # 8. MACD (15 pts)
-        if -1 <= macd <= 1:
+        # 9. MACD (15 pts)
+        if p["macd_perfect_low"] <= macd <= p["macd_perfect_high"]:
             score += 15; criteria.append(f'✅ MACD: Perfect crossover ({macd:.1f}) [15 pts]')
-        elif 1 < macd <= 3:
+        elif p["macd_perfect_high"] < macd <= p["macd_early_bullish_high"]:
             score += 12; criteria.append(f'✅ MACD: Early bullish ({macd:.1f}) [12 pts]')
-        elif -3 <= macd < -1:
+        elif p["macd_about_turn_low"] <= macd < p["macd_perfect_low"]:
             score += 10; criteria.append(f'✅ MACD: About to turn ({macd:.1f}) [10 pts]')
-        elif macd > 6:
+        elif macd > p["macd_extended_above"]:
             criteria.append(f'❌ MACD: Extended ({macd:.1f}) [0 pts]')
         else:
             score += 5; criteria.append(f'⚠ MACD: Weak ({macd:.1f}) [5 pts]')
 
-        # 9. BOLLINGER BANDS (15 pts)
-        if 8 <= bb <= 20:
+        # 10. BOLLINGER BANDS (15 pts)
+        if p["bb_lower_low"] <= bb <= p["bb_lower_high"]:
             score += 15; criteria.append(f'✅ BB: Lower band bounce ({bb:.0f}%) [15 pts]')
-        elif 20 < bb <= 30:
+        elif p["bb_lower_high"] < bb <= p["bb_below_mid_high"]:
             score += 12; criteria.append(f'✅ BB: Below middle ({bb:.0f}%) [12 pts]')
-        elif 30 < bb <= 45:
+        elif p["bb_below_mid_high"] < bb <= p["bb_middle_high"]:
             score += 8; criteria.append(f'⚠ BB: Middle zone ({bb:.0f}%) [8 pts]')
-        elif bb > 65:
+        elif bb > p["bb_upper_above"]:
             criteria.append(f'❌ BB: Upper band ({bb:.0f}%) [0 pts]')
         else:
             score += 5; criteria.append(f'⚠ BB: Neutral ({bb:.0f}%) [5 pts]')
 
-        # 10. VOLUME (15 pts)
-        if 1.3 <= vol <= 1.8:
+        # 11. VOLUME (15 pts)
+        if p["vol_perfect_low"] <= vol <= p["vol_perfect_high"]:
             score += 15; criteria.append(f'✅ Volume: Perfect accumulation ({vol:.1f}x) [15 pts]')
-        elif 1.8 < vol <= 2.2:
+        elif p["vol_perfect_high"] < vol <= p["vol_building_high"]:
             score += 12; criteria.append(f'✅ Volume: Building interest ({vol:.1f}x) [12 pts]')
-        elif vol > 2.8:
+        elif vol > p["vol_toohigh_above"]:
             score += 5; criteria.append(f'⚠ Volume: Too high ({vol:.1f}x) [5 pts]')
-        elif 1.0 <= vol < 1.3:
+        elif p["vol_avg_low"] <= vol < p["vol_perfect_low"]:
             score += 7; criteria.append(f'⚠ Volume: Average ({vol:.1f}x) [7 pts]')
         else:
             criteria.append(f'❌ Volume: Too low ({vol:.1f}x) [0 pts]')
 
-        # 11. TODAY'S PRICE (10 pts)
-        if -1.5 <= change <= 0.3:
+        # 12. TODAY'S PRICE (10 pts)
+        if p["today_perfect_low"] <= change <= p["today_perfect_high"]:
             score += 10; criteria.append(f"✅ Today: Perfect entry ({change:+.1f}%) [10 pts]")
-        elif 0.3 < change <= 1.2:
+        elif p["today_perfect_high"] < change <= p["today_early_high"]:
             score += 8; criteria.append(f"✅ Today: Early move ({change:+.1f}%) [8 pts]")
-        elif -2.5 <= change < -1.5:
+        elif p["today_dip_low"] <= change < p["today_perfect_low"]:
             score += 7; criteria.append(f"⚠ Today: Dip ({change:+.1f}%) [7 pts]")
-        elif change > 2.5:
+        elif change > p["today_rallied_above"]:
             criteria.append(f"❌ Today: Already rallied ({change:+.1f}%) [0 pts]")
         else:
             score += 4; criteria.append(f"⚠ Today: Moderate ({change:+.1f}%) [4 pts]")
 
-        # 12. MONTHLY TREND (10 pts)
-        if -8 <= monthly_change <= -2:
+        # 13. MONTHLY TREND (10 pts)
+        if p["monthly_recover_low"] <= monthly_change <= p["monthly_recover_high"]:
             score += 10; criteria.append(f'✅ Monthly: Recovering from dip ({monthly_change:+.1f}%) [10 pts]')
-        elif -2 < monthly_change <= 2:
+        elif p["monthly_recover_high"] < monthly_change <= p["monthly_base_high"]:
             score += 8; criteria.append(f'✅ Monthly: Base building ({monthly_change:+.1f}%) [8 pts]')
-        elif 2 < monthly_change <= 6:
+        elif p["monthly_base_high"] < monthly_change <= p["monthly_moderate_high"]:
             score += 5; criteria.append(f'⚠ Monthly: Moderate gain ({monthly_change:+.1f}%) [5 pts]')
-        elif monthly_change > 10:
+        elif monthly_change > p["monthly_extended_above"]:
             criteria.append(f'❌ Monthly: Extended ({monthly_change:+.1f}%) [0 pts]')
         else:
             score += 3; criteria.append(f'⚠ Monthly: Weak ({monthly_change:+.1f}%) [3 pts]')
 
-        # 13. 3-MONTH PERFORMANCE (10 pts)
-        if -15 <= three_month_change <= -5:
+        # 14. 3-MONTH PERFORMANCE (10 pts)
+        if p["three_m_correction_low"] <= three_month_change <= p["three_m_correction_high"]:
             score += 10; criteria.append(f'✅ 3-Month: Perfect correction ({three_month_change:+.1f}%) [10 pts]')
-        elif -5 < three_month_change <= 5:
+        elif p["three_m_correction_high"] < three_month_change <= p["three_m_sideways_high"]:
             score += 8; criteria.append(f'✅ 3-Month: Sideways base ({three_month_change:+.1f}%) [8 pts]')
-        elif 5 < three_month_change <= 15:
+        elif p["three_m_sideways_high"] < three_month_change <= p["three_m_moderate_high"]:
             score += 5; criteria.append(f'⚠ 3-Month: Moderate rise ({three_month_change:+.1f}%) [5 pts]')
-        elif three_month_change > 25:
+        elif three_month_change > p["three_m_overextended_above"]:
             criteria.append(f'❌ 3-Month: Overextended ({three_month_change:+.1f}%) [0 pts]')
         else:
             score += 3; criteria.append(f'⚠ 3-Month: Weak ({three_month_change:+.1f}%) [3 pts]')
 
-        # 14. UPSIDE POTENTIAL (10 pts)
-        if potential_pct >= 12:
+        # 15. UPSIDE POTENTIAL (10 pts)
+        if potential_pct >= p["upside_excellent"]:
             score += 10; criteria.append(f'✅ Upside: Excellent ({potential_pct:.1f}%) [10 pts]')
-        elif potential_pct >= 10:
+        elif potential_pct >= p["upside_verygood"]:
             score += 8; criteria.append(f'✅ Upside: Very Good ({potential_pct:.1f}%) [8 pts]')
-        elif potential_pct >= 8:
+        elif potential_pct >= p["upside_good"]:
             score += 5; criteria.append(f'⚠ Upside: Good ({potential_pct:.1f}%) [5 pts]')
         else:
             criteria.append(f'❌ Upside: Low ({potential_pct:.1f}%) [0 pts]')
 
-        threshold_exceptional = thresholds['threshold_exceptional']
-        threshold_prime = thresholds['threshold_prime']
-        threshold_excellent = thresholds['threshold_excellent']
-        threshold_strong = thresholds['threshold_strong']
-
         if is_operated:
             status = '🚨 OPERATED - AVOID'; rating = 'Operated - Avoid'
-        elif score >= threshold_exceptional:
+        elif score >= p["th_exceptional"]:
             status = '🌟 EXCEPTIONAL BUY'; rating = 'Exceptional Buy'
-        elif score >= threshold_prime:
+        elif score >= p["th_prime"]:
             status = '🚀 PRIME BUY'; rating = 'Prime Buy'
-        elif score >= threshold_excellent:
+        elif score >= p["th_excellent"]:
             status = '💎 EXCELLENT BUY'; rating = 'Excellent Buy'
-        elif score >= threshold_strong:
+        elif score >= p["th_strong"]:
             status = '✅ STRONG BUY'; rating = 'Strong Buy'
-        elif score >= 100:
+        elif score >= p["th_good"]:
             status = '👍 GOOD BUY'; rating = 'Good Buy'
-        elif score >= 80:
+        elif score >= p["th_watchlist"]:
             status = '📋 WATCHLIST'; rating = 'Watchlist'
         else:
             status = '❌ SKIP'; rating = 'Skip'
 
-        qualified = score >= threshold_excellent and not is_operated
+        qualified = score >= p["th_excellent"] and not is_operated
         bare_symbol = data['symbol'].replace('.NS', '').replace('.BO', '')
 
         return {
@@ -527,45 +710,39 @@ def render() -> None:
     rate_cfg = sc.render_rate_limit_controls(MODE_KEY)
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("💰 Market Cap Filter")
+    st.sidebar.subheader("💰 Filters")
     min_market_cap = st.sidebar.slider("Minimum Market Cap (₹ Crores)", 0, 100000, 5000, 1000,
                                         help="Filter stocks by minimum market capitalization",
                                         key=sskey(MODE_KEY, "min_mcap"))
+    pc1, pc2 = st.sidebar.columns(2)
+    with pc1:
+        min_price = st.number_input("Min Price (₹)", min_value=0.0, max_value=1000000.0, value=0.0, step=10.0,
+                                     key=sskey(MODE_KEY, "min_price"))
+    with pc2:
+        max_price = st.number_input("Max Price (₹)", min_value=0.0, max_value=10000000.0, value=1000000.0, step=100.0,
+                                     key=sskey(MODE_KEY, "max_price"))
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🎯 Adjustable Scoring Thresholds")
-    with st.sidebar.expander("📊 Customize Score Thresholds", expanded=False):
-        st.markdown("**Qualification Scores:**")
-        threshold_exceptional = st.number_input("Exceptional (≥)", 100, 250, 180, 10, key=sskey(MODE_KEY, "th_exc"))
-        threshold_prime = st.number_input("Prime (≥)", 100, 250, 160, 10, key=sskey(MODE_KEY, "th_prime"))
-        threshold_excellent = st.number_input("Excellent (≥)", 100, 250, 140, 10, key=sskey(MODE_KEY, "th_excel"))
-        threshold_strong = st.number_input("Strong (≥)", 50, 200, 120, 10, key=sskey(MODE_KEY, "th_strong"))
-        st.markdown("**Technical Thresholds:**")
-        rsi_low = st.number_input("RSI Lower Bound", 20, 50, 32, 1, key=sskey(MODE_KEY, "rsi_low"))
-        rsi_high = st.number_input("RSI Upper Bound", 30, 60, 38, 1, key=sskey(MODE_KEY, "rsi_high"))
-
-    thresholds = {
-        'threshold_exceptional': threshold_exceptional, 'threshold_prime': threshold_prime,
-        'threshold_excellent': threshold_excellent, 'threshold_strong': threshold_strong,
-        'rsi_low': rsi_low, 'rsi_high': rsi_high,
-    }
+    st.sidebar.subheader("🎛️ Scoring Parameters")
+    st.sidebar.caption("Every cutoff below drives the scoring bands — adjust freely, the point weights per band stay fixed.")
+    params = _params_ui(MODE_KEY)
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎯 ULTRA-STRICT Criteria")
-    st.sidebar.info("""*Only top 1-3% qualify!* **TOTAL: 250 Points**
+    st.sidebar.info(f"""*Only top 1-3% qualify!* **TOTAL: 265 Points**
 
-**Fundamentals (80):** Market Cap 15 · Revenue Growth 25 · Profit Growth 25 · Profit Margin 15
+**Fundamentals (95):** Market Cap 15 · Revenue Growth 25 · Profit Growth 25 · Profit Margin 15 · Cash/Revenue 15
 **Technicals (170):** FII/DII 20 · Consolidation 20 · RSI 20 · MACD 15 · BB 15 · Volume 15 · Today 10 · Monthly 10 · 3-Month 10 · Upside 10
 
-**Qualification:** Exceptional ≥180 · Prime 160-179 · Excellent 140-159 ✅ · Strong 120-139
+**Qualification:** Exceptional ≥{params['th_exceptional']} · Prime {params['th_prime']}-{params['th_exceptional']-1} · Excellent {params['th_excellent']}-{params['th_prime']-1} ✅ · Strong {params['th_strong']}-{params['th_excellent']-1}
 **Penalties:** Operated -70 · High Risk -25 to -40
 """)
 
     def fetch_and_analyze(rec):
-        data = sc.bulletproof_fetch(fetch_stock_data, rec["yf_symbol"])
+        data = sc.bulletproof_fetch(fetch_stock_data, rec["yf_symbol"], params)
         if data is None:
             return 'failed', None
-        analysis = analyze_stock(data, min_market_cap, thresholds)
+        analysis = analyze_stock(data, min_market_cap, min_price, max_price, params)
         if analysis is None:
             return 'filtered', None
         analysis['name'] = rec['name']
@@ -577,11 +754,11 @@ def render() -> None:
     if do_scan:
         sc.run_scan(MODE_KEY, stocks_to_scan, fetch_and_analyze, rate_cfg, resume_scan, checkpoint)
 
-    _render_results(thresholds)
+    _render_results(params)
     sc.footer("<strong>NSE & BSE Positional Scanner with Fundamentals</strong> | Top 1-3% Only")
 
 
-def _render_results(thresholds) -> None:
+def _render_results(params) -> None:
     results = get_state(MODE_KEY, "results")
     if not results:
         st.info("👈 Configure and click 'FIND EXCEPTIONAL STOCKS' to start")
@@ -654,10 +831,10 @@ def _render_results(thresholds) -> None:
     } for r in results])
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    threshold_exceptional = thresholds['threshold_exceptional']
-    threshold_prime = thresholds['threshold_prime']
-    threshold_excellent = thresholds['threshold_excellent']
-    threshold_strong = thresholds['threshold_strong']
+    threshold_exceptional = params['th_exceptional']
+    threshold_prime = params['th_prime']
+    threshold_excellent = params['th_excellent']
+    threshold_strong = params['th_strong']
 
     exceptional = df[(df['Score'] >= threshold_exceptional) & (df['Operated'] == '✅ Safe')]
     prime = df[(df['Score'] >= threshold_prime) & (df['Score'] < threshold_exceptional) & (df['Operated'] == '✅ Safe')]
@@ -711,7 +888,7 @@ def _render_results(thresholds) -> None:
         all_sectors = sorted(df['Sector'].unique().tolist())
         sector_filter = [s for s in all_sectors if st.checkbox(s, value=True, key=sskey(MODE_KEY, f"flt_sector_{s}"))]
     with f5:
-        min_score_filter = st.number_input("Min Score", 0, 250, threshold_excellent, 10,
+        min_score_filter = st.number_input("Min Score", 0, 300, threshold_excellent, 10,
                                             key=sskey(MODE_KEY, "flt_min_score"))
 
     filtered_df = df.copy()
