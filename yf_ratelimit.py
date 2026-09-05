@@ -63,6 +63,10 @@ REQUEST_TIMEOUT_S = 15.0   # hard ceiling per HTTP request
 CACHE_TTL_S = 3600         # in-process property/history cache TTL
 TICKER_REGISTRY_MAX = 300  # bounded LRU: live _CachedTicker objects
 MEM_CACHE_MAX = 150        # bounded LRU: cached property/history values
+EMPTY_BURST_WINDOW_S = 10.0  # window used to tell "one dead symbol" from "we're throttled"
+EMPTY_BURST_THRESHOLD = 4    # this many empty responses across ALL threads within the window
+                             # looks like a real block; fewer than that is just ordinary
+                             # delisted/renamed tickers in a large universe (see below)
 
 _PROXY_URL: str | None = (
     os.environ.get("YF_HTTP_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
@@ -72,10 +76,12 @@ _session_version = 0  # bumped on proxy change so live threads rebuild their ses
 
 def configure(max_retries: int | None = None, base_backoff: float | None = None,
               min_delay: float | None = None, cooldown: float | None = None,
-              proxy: str | None = None) -> None:
+              proxy: str | None = None, empty_burst_threshold: int | None = None,
+              empty_burst_window: float | None = None) -> None:
     """Called from the sidebar's Retry/Backoff controls (and safe to call at
     the start of every scan) to change retry behaviour without a restart."""
     global MAX_RETRIES, BASE_BACKOFF_S, MIN_DELAY_S, COOLDOWN_S, _PROXY_URL, _session_version
+    global EMPTY_BURST_THRESHOLD, EMPTY_BURST_WINDOW_S
     if max_retries is not None:
         MAX_RETRIES = max(1, int(max_retries))
     if base_backoff is not None:
@@ -87,6 +93,10 @@ def configure(max_retries: int | None = None, base_backoff: float | None = None,
     if proxy is not None:
         _PROXY_URL = proxy.strip() or None
         _session_version += 1  # existing per-thread sessions rebuild on next use
+    if empty_burst_threshold is not None:
+        EMPTY_BURST_THRESHOLD = max(1, int(empty_burst_threshold))
+    if empty_burst_window is not None:
+        EMPTY_BURST_WINDOW_S = max(0.5, float(empty_burst_window))
 
 
 _CHROME_UA = (
@@ -115,6 +125,32 @@ def _log_event(message: str, level: str = "info") -> None:
 def get_recent_events(n: int = 15) -> list[dict]:
     with _event_lock:
         return list(_event_log)[-n:]
+
+
+# ── empty-response burst detector ───────────────────────────────────────
+# A single empty DataFrame from Yahoo is ambiguous: it's what a genuinely
+# delisted/renamed/wrong-suffix symbol looks like, and it's ALSO what a
+# silent throttle looks like on a shared/free-tier IP. Treating every
+# empty response as "we're throttled" was the actual root cause behind
+# scans stalling on nothing more than one bad ticker: it burned the full
+# retry ladder (with the shared COOLDOWN_S applied on every attempt)
+# against a symbol that was never going to return data no matter how long
+# every worker thread waited. A large NSE/BSE universe routinely has
+# hundreds of these, so that mistake compounds fast.
+# Only treat it as a real block once several independent empty responses
+# land close together — that pattern doesn't happen from scattered dead
+# tickers, only from Yahoo actually blocking this process.
+_empty_event_times: "deque[float]" = deque()
+_empty_event_lock = threading.Lock()
+
+
+def _empty_response_looks_like_throttle() -> bool:
+    now = time.time()
+    with _empty_event_lock:
+        _empty_event_times.append(now)
+        while _empty_event_times and (now - _empty_event_times[0]) > EMPTY_BURST_WINDOW_S:
+            _empty_event_times.popleft()
+        return len(_empty_event_times) >= EMPTY_BURST_THRESHOLD
 
 
 def get_status() -> dict:
@@ -243,16 +279,21 @@ def _with_retry(fn, *args, **kwargs):
             _inflight += 1
         try:
             result = fn(*args, **kwargs)
-            # An empty DataFrame on a shared/free-tier IP is usually a
-            # silent throttle rather than real "no data" — treat it like a
-            # 429 (shared cooldown) instead of retrying alone on this thread
-            # while every other worker keeps hammering the same block.
-            if isinstance(result, pd.DataFrame) and result.empty and attempt < MAX_RETRIES - 1:
-                logger.warning("yf_ratelimit: empty DataFrame on attempt %d — retrying", attempt + 1)
-                _log_event(f"⚠️ Empty response (attempt {attempt + 1}) — possible silent throttle", "warning")
-                last_exc = RuntimeError("Empty DataFrame returned (possible silent 429)")
-                _trigger_cooldown()
-                continue
+            if isinstance(result, pd.DataFrame) and result.empty:
+                # Only escalate to a shared cooldown + retry if several
+                # empty responses have landed close together process-wide —
+                # that's the actual throttle signature. A single empty
+                # response is returned immediately as-is: it's very likely
+                # just this one symbol having no data, and retrying it
+                # against a manufactured cooldown would only slow down
+                # every other worker for a result that was never coming.
+                if attempt < MAX_RETRIES - 1 and _empty_response_looks_like_throttle():
+                    logger.warning("yf_ratelimit: empty-response burst detected on attempt %d — retrying", attempt + 1)
+                    _log_event(f"⚠️ Empty-response burst (attempt {attempt + 1}) — likely throttle", "warning")
+                    last_exc = RuntimeError("Empty DataFrame returned (possible silent 429 burst)")
+                    _trigger_cooldown()
+                    continue
+                return result
             return result
         except Exception as exc:
             last_exc = exc
